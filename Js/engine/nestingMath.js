@@ -1,0 +1,301 @@
+/**
+ * nestingMath.js
+ * Exact formulas for every nesting / bundling type.
+ *
+ * All formulas match the spec:
+ *  C-channel Box Nesting  ? H_eff = H_web + (N-1)*(t + clearance)
+ *  Z-purlin Contour       ? ?x = W-t, ?y = D+t
+ *  Rod Hexagonal          ? stepY = d*sqrt(3)/2, odd rows shifted d/2
+ *  Grid (beams, L, RHS)   ? bestGrid(N, unitW, unitH)
+ *  Plate Stack            ? H_stack = N * thickness
+ *
+ * The packing engine calls ONLY these functions.
+ * No math is duplicated anywhere else.
+ */
+'use strict';
+
+// ?????????????????????????????????????????????????????????????????????????????
+// C-Channel Box Nesting (Spec §2A)
+// Two C's paired face-to-face. Each pair fills one slot in the grid.
+// Pieces at even index i: Rotation = 0°
+// Pieces at odd  index i: Rotation = 180° (longitudinal axis) ? flipped
+//
+// H_eff = H_web + (N_pairs - 1) * H_pair   where H_pair = 2*H_web - 2*ft
+// pair SLOT:
+//   Piece 0 (normal)  : P1 = (0, 0, 0),            R = 0°
+//   Piece 1 (inverted): P2 = (0, H_web - ft, 0),   R = 180° around Z
+// ?????????????????????????????????????????????????????????????????????????????
+
+/**
+ * @param {number} qty
+ * @param {number} unitH  - web height of one C-channel (mm)
+ * @param {number} unitW  - flange width of one C-channel (mm)
+ * @param {number} ft     - flange thickness (mm)
+ * @returns {{ bundleW: number, bundleH: number, transforms: object[] }}
+ */
+function cChannelBundleMetrics(qty, unitH, unitW, ft) {
+    const clearance = CONSTANTS.NESTING_CLEARANCE;
+    const numPairs = Math.ceil(qty / 2);
+    const pairH = 2 * unitH - 2 * ft + clearance;
+    const { cols, rows } = bestGrid(numPairs, unitW, pairH);
+
+    const bundleW = cols * unitW;
+    const bundleH = rows * pairH;
+
+    const transforms = [];
+    for (let p = 0; p < numPairs; p++) {
+        const col = p % cols;
+        const row = Math.floor(p / cols);
+        const baseY = row * pairH;
+        const baseZ = col * unitW;
+
+        // Piece at index 2p (even) — normal orientation
+        transforms.push({
+            pieceIndex: p * 2,
+            dy: baseY,
+            dz: baseZ,
+            rotZ_deg: 0,          // 0° rotation
+            isMirror: false,
+        });
+        // Piece at index 2p+1 (odd) — flipped 180°
+        if (p * 2 + 1 < qty) {
+            transforms.push({
+                pieceIndex: p * 2 + 1,
+                dy: baseY + unitH - ft,
+                dz: baseZ,
+                rotZ_deg: 180,        // 180° rotation (flipped)
+                isMirror: true,
+            });
+        }
+    }
+
+    return { bundleW, bundleH, cols, rows, numPairs, transforms };
+}
+
+
+// ?????????????????????????????????????????????????????????????????????????????
+// Z-Purlin Contour Nesting (Spec §2B)
+// Each Z nests into the inner contour of the previous one.
+//   ?x = W_flange - t_web           (along Z axis in packing space)
+//   ?y = D_lip + t_web              (along Y axis)
+// ?????????????????????????????????????????????????????????????????????????????
+
+/**
+ * @param {number} qty
+ * @param {number} unitH  - web height (mm)
+ * @param {number} unitW  - flange width (mm)
+ * @param {number} ft     - thickness (mm)
+ * @param {number} lipH   - lip height D (mm); estimated as 0.12*H if 0
+ * @returns {{ bundleW, bundleH, deltaX, deltaY, transforms }}
+ */
+function zPurlinBundleMetrics(qty, unitH, unitW, ft, lipH) {
+    const D = lipH > 0 ? lipH : unitH * 0.12;
+    const deltaX = unitW - ft;      // ?x
+    const deltaY = D + ft;          // ?y
+
+    // Compact the bundle into rows: cols × rows
+    const maxPerRow = Math.max(1, Math.floor(unitW * 6 / Math.max(deltaX, 1)));
+    const cols = Math.min(qty, maxPerRow);
+    const rows = Math.ceil(qty / cols);
+
+    const bundleW = unitW + (cols - 1) * deltaX;
+    const bundleH = unitH + (rows - 1) * deltaY;
+
+    const transforms = [];
+    for (let i = 0; i < qty; i++) {
+        const col = i % cols;
+        const row = Math.floor(i / cols);
+        transforms.push({
+            pieceIndex: i,
+            dy: row * deltaY,
+            dz: col * deltaX,
+            rotZ_deg: 0,          // Z's nest by geometry, not by rotation
+            isMirror: false,
+            deltaX, deltaY,
+        });
+    }
+
+    return { bundleW, bundleH, cols, rows, deltaX, deltaY, transforms };
+}
+
+
+// ?????????????????????????????????????????????????????????????????????????????
+// Rod Hexagonal Close-Pack
+// Tightest packing for equal circles.
+//   stepZ = d         (horizontal spacing within a row)
+//   stepY = d*?3/2    (vertical spacing between rows — HALF the equilateral height)
+//   Odd rows shifted by d/2 in Z ? true hex pattern
+// ?????????????????????????????????????????????????????????????????????????????
+
+/**
+ * @param {number} qty
+ * @param {number} diam  - rod diameter (mm)
+ * @returns {{ bundleW, bundleH, cols, rows, transforms }}
+ */
+function rodHexBundleMetrics(qty, diam) {
+    const { cols, rows } = bestGrid(qty, diam, diam);
+    const stepZ = diam;
+    const stepY = diam * Math.sqrt(3) / 2;
+
+    const bundleH = rows * stepY;
+    const bundleW = cols * stepZ + stepZ / 2;   // +d/2 for odd-row shift
+
+    const transforms = [];
+    let placed = 0;
+    outer: for (let r = 0; r < rows; r++) {
+        for (let c = 0; c < cols; c++) {
+            if (placed >= qty) break outer;
+            const shiftZ = (r % 2 === 1) ? stepZ / 2 : 0;   // hex offset
+            transforms.push({
+                pieceIndex: placed,
+                dy: r * stepY,
+                dz: c * stepZ + shiftZ,
+                rotZ_deg: 0,
+                isMirror: false,
+            });
+            placed++;
+        }
+    }
+
+    return { bundleW, bundleH, cols, rows, transforms };
+}
+
+
+// ?????????????????????????????????????????????????????????????????????????????
+// Generic Grid (I-beams, L-angles, RHS)
+// rows × cols tightly packed, no rotation
+// ?????????????????????????????????????????????????????????????????????????????
+
+/**
+ * @param {number} qty
+ * @param {number} unitW
+ * @param {number} unitH
+ * @returns {{ bundleW, bundleH, cols, rows, transforms }}
+ */
+function gridBundleMetrics(qty, unitW, unitH) {
+    const { cols, rows } = bestGrid(qty, unitW, unitH);
+    const bundleW = cols * unitW;
+    const bundleH = rows * unitH;
+
+    const transforms = [];
+    let placed = 0;
+    outer: for (let r = 0; r < rows; r++) {
+        for (let c = 0; c < cols; c++) {
+            if (placed >= qty) break outer;
+            transforms.push({
+                pieceIndex: placed,
+                dy: r * unitH,
+                dz: c * unitW,
+                rotZ_deg: 0,
+                isMirror: false,
+            });
+            placed++;
+        }
+    }
+
+    return { bundleW, bundleH, cols, rows, transforms };
+}
+
+
+// ?????????????????????????????????????????????????????????????????????????????
+// Plate Stack
+// Plates always lay flat. bundleH = N * thickness
+// ?????????????????????????????????????????????????????????????????????????????
+
+/**
+ * @param {number} qty
+ * @param {number} thickness  - single plate thickness (mm)
+ * @param {number} length_mm
+ * @param {number} width_mm
+ * @returns {{ bundleL, bundleW, bundleH, transforms }}
+ */
+function plateStackMetrics(qty, thickness, length_mm, width_mm) {
+    const bundleH = qty * thickness;
+    const transforms = [];
+    for (let i = 0; i < qty; i++) {
+        transforms.push({ pieceIndex: i, dy: i * thickness, dz: 0, rotZ_deg: 0, isMirror: false });
+    }
+    return { bundleL: length_mm, bundleW: width_mm, bundleH, transforms };
+}
+
+
+// ?????????????????????????????????????????????????????????????????????????????
+// Utility: bestGrid
+// Returns (cols, rows) for the most compact near-square bounding box for qty,
+// preferring exact grids (cols*rows == qty) so the renderer doesn't show empty slots.
+// ?????????????????????????????????????????????????????????????????????????????
+
+function bestGrid(qty, unitW, unitH) {
+    let bestCols = 1, bestRows = qty;
+    let bestMax = Infinity;
+    let foundExact = false;
+
+    for (let c = 1; c <= qty; c++) {
+        const r = Math.ceil(qty / c);
+        const w = c * unitW;
+        const h = r * unitH;
+        const maxDim = Math.max(w, h);
+        const exact = (c * r === qty);
+        const beats = (exact && !foundExact) || (exact === foundExact && maxDim < bestMax);
+        if (beats) {
+            bestMax = maxDim; bestCols = c; bestRows = r;
+            if (exact) foundExact = true;
+        }
+    }
+    return { cols: bestCols, rows: bestRows };
+}
+
+
+// ?????????????????????????????????????????????????????????????????????????????
+// Dispatcher: compute bundle metrics for any bundleMode
+// The packing engine calls only this function — never the individual helpers.
+// ?????????????????????????????????????????????????????????????????????????????
+
+/**
+ * @param {object} item         - enriched item (from itemProperties.js)
+ * @param {number} qty          - how many pieces in THIS sub-bundle
+ * @param {number} weightKg     - total weight for this sub-bundle
+ * @returns {{ bundleL, bundleW, bundleH, weight, transforms, nestingInfo }}
+ */
+function computeBundle(item, qty, weightKg) {
+    const { lengthMm: L, widthMm: W, heightMm: H,
+        flangeT_mm: ft, lipH_mm: lip, diam_mm: diam,
+        bundleMode } = item;
+
+    let metrics;
+
+    if (bundleMode === 'pair') {
+        const r = cChannelBundleMetrics(qty, H, W, ft > 0 ? ft : H * 0.10);
+        metrics = { bundleL: L, bundleW: r.bundleW, bundleH: r.bundleH, ...r };
+    } else if (bundleMode === 'contour') {
+        const r = zPurlinBundleMetrics(qty, H, W, ft > 0 ? ft : H * 0.08, lip);
+        metrics = { bundleL: L, bundleW: r.bundleW, bundleH: r.bundleH, ...r };
+    } else if (bundleMode === 'hex') {
+        const d = diam > 0 ? diam : Math.max(W, H);
+        const r = rodHexBundleMetrics(qty, d);
+        metrics = { bundleL: L, bundleW: r.bundleW, bundleH: r.bundleH, ...r };
+    } else if (bundleMode === 'stack') {
+        const r = plateStackMetrics(qty, H, L, W);
+        metrics = { bundleL: r.bundleL, bundleW: r.bundleW, bundleH: r.bundleH, ...r };
+    } else {
+        // 'grid' — default for I-beams, L-angles, RHS
+        const r = gridBundleMetrics(qty, W, H);
+        metrics = { bundleL: L, bundleW: r.bundleW, bundleH: r.bundleH, ...r };
+    }
+
+    return {
+        ...metrics,
+        weight: weightKg,
+        qty,
+        unitLengthMm: L, unitWidthMm: W, unitHeightMm: H,
+        shapeKey: item.shapeKey,
+        bundleMode,
+        mark: item.mark,
+        assemblyName: item.assemblyName,
+        profileDesc: item.profileDesc,
+        flangeT_mm: ft, webT_mm: item.webT_mm,
+        lipH_mm: lip, diam_mm: diam,
+        loadLayer: item.loadLayer,
+        supportRequired: item.supportRequired,
+    };
+}

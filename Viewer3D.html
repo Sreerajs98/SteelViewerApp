@@ -1,0 +1,2015 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Steel Container 3D Viewer</title>
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#111318; overflow:hidden; font-family: Arial, Helvetica, sans-serif; }
+  #canvas-wrap { position:absolute; inset:0; }
+  #dropZone {
+    position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+    background:#111318; color:#8a8776; flex-direction:column; gap:16px; z-index:10;
+  }
+  #dropZone.hidden { display:none; }
+  #dropZone label {
+    border:1px dashed #444; padding:14px 22px; border-radius:8px; cursor:pointer;
+    color:#e8e6df; font-size:14px;
+  }
+  #dropZone label:hover { border-color:#666; }
+  #panel {
+    position:absolute; top:16px; left:16px; width:240px;
+    background:rgba(20,22,28,0.92); color:#e8e6df; border:1px solid #333;
+    border-radius:8px; padding:14px 16px; font-size:13px; line-height:1.55; display:none;
+  }
+  #panel h1 { font-size:15px; margin:0 0 8px; font-weight:600; color:#fff; padding-right:22px; }
+  #panelClose {
+    position:absolute; top:10px; right:10px; width:22px; height:22px;
+    border:1px solid #333; border-radius:4px; background:#1c1e24; color:#b7b4a9;
+    cursor:pointer; padding:0; font-size:14px; line-height:1;
+  }
+  #panelClose:hover { border-color:#666; color:#fff; }
+  #panel .row { display:flex; justify-content:space-between; color:#b7b4a9; }
+  #panel .row b { color:#e8e6df; font-weight:600; }
+  #modeButtons { display:flex; gap:8px; margin:10px 0; }
+  #modeButtons button {
+    flex:1; background:#1c1e24; color:#e8e6df; border:1px solid #333; border-radius:6px;
+    padding:8px 6px; font-size:12.5px; cursor:pointer;
+  }
+  #modeButtons button.active { background:#378ADD; border-color:#378ADD; color:#fff; }
+  #modeButtons button:hover { border-color:#666; }
+  #tabs { display:flex; gap:6px; margin:10px 0 4px; flex-wrap:wrap; }
+  #tabs button {
+    background:#1c1e24; color:#b7b4a9; border:1px solid #333; border-radius:6px;
+    padding:5px 10px; font-size:12px; cursor:pointer;
+  }
+  #tabs button.active { background:#1D9E75; color:#fff; border-color:#1D9E75; }
+  #legend { margin-top:10px; border-top:1px solid #333; padding-top:10px; }
+  #legend div { display:flex; align-items:center; gap:8px; margin-bottom:5px; }
+  .swatch { width:12px; height:12px; border-radius:2px; flex:none; }
+  #note { margin-top:10px; border-top:1px solid #333; padding-top:8px; color:#8a8776; font-size:11px; }
+  #info {
+    position:absolute; top:16px; left:340px; max-width:280px; min-height:20px;
+    background:rgba(20,22,28,0.92); color:#e8e6df; border:1px solid #333;
+    border-radius:8px; padding:10px 14px; font-size:12px; line-height:1.5; display:none;
+    z-index:15;
+  }
+  #info button {
+    background:#1c1e24; color:#e8e6df; border:1px solid #333; border-radius:6px;
+    padding:5px 10px; font-size:11.5px; cursor:pointer;
+  }
+  #info button:hover { border-color:#666; }
+  #info b { color:#fff; }
+  #rotWidget {
+    position:absolute; top:70px; right:16px; width:340px;
+    background:rgba(20,22,28,0.95); border:1px solid #333; border-radius:8px;
+    padding:12px 14px; color:#e8e6df; font-size:12.5px; display:none; z-index:20;
+  }
+  #rotWidgetTitle { font-size:13px; color:#fff; margin-bottom:8px; font-weight:600; }
+  #rotPreviewCanvas {
+    display:block; width:320px; height:220px; background:#0a0b0e; border-radius:4px;
+    border:1px solid #1a1c22; cursor:grab;
+  }
+  #rotPreviewCanvas:active { cursor:grabbing; }
+  .rotHint { font-size:10.5px; color:#66625a; text-align:center; margin:6px 0 8px; }
+  .rotBtnRow { display:flex; gap:5px; margin-top:6px; }
+  .rotBtnRow button {
+    flex:1; background:#1c1e24; color:#e8e6df; border:1px solid #333;
+    border-radius:6px; padding:6px 8px; font-size:11.5px; cursor:pointer;
+  }
+  .rotBtnRow button:hover { border-color:#666; }
+  .rotBtnRow button.rotApply { background:#1D9E75; color:#fff; border-color:#1D9E75; }
+  .rotBtnRow button.rotApply:hover { background:#25b587; }
+  #hint { position:absolute; bottom:16px; right:16px; color:#66625a; font-size:11px; display:none; }
+  #loadAnother { position:absolute; top:16px; right:16px; display:none; }
+  #loadAnother label {
+    border:1px solid #333; background:rgba(20,22,28,0.9); color:#b7b4a9;
+    padding:8px 14px; border-radius:6px; cursor:pointer; font-size:12px;
+  }
+</style>
+</head>
+<body>
+
+<div id="dropZone">
+  <div>Load a Shipping List Excel (.xlsx) directly - or a scene.json exported by the C# app</div>
+  <label>Choose file<input type="file" id="fileInput" accept=".xlsx,.json" style="display:none"></label>
+</div>
+
+<div id="canvas-wrap"></div>
+
+<div id="panel">
+  <button id="panelClose" title="Hide panel" onclick="document.getElementById('panel').style.display='none'; document.getElementById('showPanelBtn').style.display='block';">&times;</button>
+  <h1 id="jobTitle">-</h1>
+  <div id="modeButtons">
+    <button id="btnQuick">Quick view</button>
+    <button id="btnOptimize">Optimize packing</button>
+  </div>
+  <div id="tabs"></div>
+  <div class="row"><span>Container</span><b id="contDims">-</b></div>
+  <div class="row"><span>Pieces shown</span><b id="pieceCount">-</b></div>
+  <div class="row"><span>Weight used</span><b id="weightUtil">-</b></div>
+  <div class="row"><span>Volume used</span><b id="volUtil">-</b></div>
+  <div style="margin-top:10px; padding-top:8px; border-top:1px solid #333; font-size:11.5px; color:#b7b4a9">
+    <div style="color:#8a8776; margin-bottom:4px;">Shapes in this container</div>
+    <div id="shapeSum"></div>
+  </div>
+  <div id="legend"></div>
+  <div id="dataIssues" style="display:none; margin-top:10px; border-top:1px solid #333; padding-top:10px; font-size:11.5px; max-height:160px; overflow-y:auto;"></div>
+  <div id="note">"Quick view" is a fast rough preview. "Optimize packing" runs a real 3D bin-packing pass (height layers, then rows, then length) that respects each item's true length/width/height and the container's weight limit. Click a piece for details.</div>
+</div>
+
+<div id="loadAnother"><label>Load another job<input type="file" id="fileInput2" accept=".xlsx,.json" style="display:none"></label></div>
+
+<!-- Rotation preview widget: appears in top-right when a piece is selected -->
+<div id="rotWidget">
+  <div id="rotWidgetTitle">Rotation preview</div>
+  <canvas id="rotPreviewCanvas" width="320" height="220"></canvas>
+  <div class="rotHint">Drag inside to spin the view &middot; red = X axis, green = Y, blue = Z</div>
+  <div class="rotBtnRow">
+    <button onclick="rotPreview('x')">Rotate X 90&deg;</button>
+    <button onclick="rotPreview('y')">Rotate Y 90&deg;</button>
+    <button onclick="rotPreview('z')">Rotate Z 90&deg;</button>
+  </div>
+  <div class="rotBtnRow">
+    <button class="rotApply" onclick="rotPreviewApply()">Done - apply to piece</button>
+    <button onclick="rotPreviewReset()">Reset</button>
+  </div>
+</div>
+
+<div id="info"></div>
+<button id="showPanelBtn" style="position:absolute; top:16px; left:16px; display:none; background:rgba(20,22,28,0.92); color:#e8e6df; border:1px solid #333; border-radius:6px; padding:6px 12px; font-size:12px; cursor:pointer; z-index:15;" onclick="document.getElementById('panel').style.display='block'; this.style.display='none';">Info</button>
+<div id="hint">Drag empty space to rotate camera &middot; scroll to zoom &middot; click a piece, then use arrow keys to move (PgUp/PgDn for up/down)</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script>
+const SCALE = 1/100; // mm -> scene units
+const COLORS = { beam:0x378ADD, rod:0x1D9E75, plate:0xEF9F27, purlin:0x7F77DD, other:0x888780 };
+const OVERSIZED_COLOR = 0xE24B4A;
+
+let scene, camera, renderer, controls, raycaster, mouse;
+let clickable = [];
+let rawScene = null;      // { jobNo, bldgNo, phaseNo, customer, containerSpec, items[] }
+let currentLayout = null; // { containers:[...], oversized:[...] }
+let currentMode = 'quick';
+let dataIssues = [];      // items excluded for having invalid/garbage dimensions or weight
+let currentContainerIdx = 0;
+
+// ------------------------------------------------------------------
+// THREE.JS BOILERPLATE
+// ------------------------------------------------------------------
+function initThree() {
+  scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x111318);
+  camera = new THREE.PerspectiveCamera(45, window.innerWidth/window.innerHeight, 0.1, 4000);
+  renderer = new THREE.WebGLRenderer({ antialias:true });
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  document.getElementById('canvas-wrap').appendChild(renderer.domElement);
+  controls = new THREE.OrbitControls(camera, renderer.domElement);
+  addLights();
+  raycaster = new THREE.Raycaster();
+  mouse = new THREE.Vector2();
+
+  // 'mousedown' registered in the CAPTURE phase so it runs before
+  // OrbitControls' own mousedown handler (which was attached earlier, in
+  // bubble phase) - this lets us disable orbit-rotation for this click
+  // BEFORE OrbitControls sees it, whenever the click is starting a piece
+  // drag instead of a camera rotation.
+  renderer.domElement.addEventListener('mousedown', onMouseDown, true);
+  renderer.domElement.addEventListener('mousemove', onMouseMove);
+  renderer.domElement.addEventListener('mouseup', onMouseUp);
+  renderer.domElement.addEventListener('click', onClick);
+  window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth/window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  });
+
+  // Keyboard nudge: 100mm per press. Axis mapping matches the user's
+  // preferred convention - horizontal arrows control Y (up/down in the
+  // scene), vertical arrows control X (along container length),
+  // PageUp/PageDown control Z (across container width).
+  window.addEventListener('keydown', (e) => {
+    if (!selected) return;
+    const target = e.target;
+    if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)) return;
+    const step = 100 * SCALE;
+    let dx = 0, dy = 0, dz = 0;
+    switch (e.key) {
+      case 'ArrowLeft':  dy = -step; break;   // Y-  (down in Y)
+      case 'ArrowRight': dy =  step; break;   // Y+  (up in Y)
+      case 'ArrowUp':    dx =  step; break;   // X+  (forward along length)
+      case 'ArrowDown':  dx = -step; break;   // X-  (back along length)
+      case 'PageUp':     dz = -step; break;   // Z-  (front across width)
+      case 'PageDown':   dz =  step; break;   // Z+  (back across width)
+      default: return;
+    }
+    e.preventDefault();
+    selected.mesh.position.x += dx;
+    selected.mesh.position.y += dy;
+    selected.mesh.position.z += dz;
+    checkSelectedFit();
+    renderInfoPanel();
+  });
+
+  animate();
+}
+
+function addLights() {
+  scene.add(new THREE.AmbientLight(0xffffff, 0.65));
+  const dir = new THREE.DirectionalLight(0xffffff, 0.7);
+  dir.position.set(80, 150, 100);
+  scene.add(dir);
+}
+
+function animate() {
+  requestAnimationFrame(animate);
+  controls.update();
+  renderer.render(scene, camera);
+}
+
+function clearScene() {
+  while (scene.children.length) scene.remove(scene.children[0]);
+  addLights();
+  clickable = [];
+  selected = null;
+  document.getElementById('info').style.display = 'none';
+}
+
+function makeBox(l, h, w, color, opacity) {
+  const geo = new THREE.BoxGeometry(Math.max(l*SCALE,0.05), Math.max(h*SCALE,0.05), Math.max(w*SCALE,0.05));
+  const mat = new THREE.MeshStandardMaterial({ color, opacity: opacity ?? 0.95, transparent:true });
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.add(new THREE.LineSegments(new THREE.EdgesGeometry(geo),
+    new THREE.LineBasicMaterial({ color:0x000000, opacity:0.3, transparent:true })));
+  return mesh;
+}
+
+// A round bar/rod - drawn as a cylinder with a sensible max radius so a
+// data-quality issue (e.g. an angled brace whose bounding box gave a huge
+// cross-section) doesn't render as a giant tube. Real steel rods are rarely
+// wider than ~150mm; anything larger visually is capped for clarity while
+// packing still uses the true dimensions.
+function makeRod(l, h, w, color, opacity) {
+  const rawR = (w + h) / 4;
+  const cappedR = Math.min(rawR, 150); // cap visual radius at 150mm
+  const radius = Math.max(cappedR * SCALE, 0.03);
+  const geo = new THREE.CylinderGeometry(radius, radius, Math.max(l*SCALE, 0.05), 12);
+  const mat = new THREE.MeshStandardMaterial({ color, opacity: opacity ?? 0.95, transparent:true });
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.rotation.z = Math.PI / 2;
+  mesh.add(new THREE.LineSegments(new THREE.EdgesGeometry(geo),
+    new THREE.LineBasicMaterial({ color:0x000000, opacity:0.25, transparent:true })));
+  return mesh;
+}
+
+// A compact bundle of N identical round rods, arranged in a near-square grid
+// and rendered as N small cylinders (capped for performance) so the viewer
+// clearly sees "this is a bundle of pipes" not one giant cylinder.
+// A bundle of N identical round rods arranged in a rows × cols grid
+// (like the container-of-rods reference photo). Each rod is a real
+// cylinder at its own grid slot - qty is faithfully shown up to a
+// performance cap.
+// A bundle of N identical round rods in a HEXAGONAL close-pack layout -
+// the tightest possible packing for equal circles. Odd rows are shifted
+// horizontally by d/2, and rows are spaced vertically by d·√3/2 so every
+// rod touches six neighbours. This is how rebar and rod bundles actually
+// ship in real containers.
+function makeRodBundle(l, unitDiam, cols, rows, qty, color, opacity) {
+  const group = new THREE.Group();
+  const totalToShow = Math.min(qty, 100);
+  const r = Math.max(unitDiam / 2 * SCALE, 0.03);
+  const d = unitDiam * SCALE;
+  const stepY = d * Math.sqrt(3) / 2;   // vertical spacing between hex rows
+  const stepZ = d;                        // horizontal spacing within a row
+  const totalH = rows * stepY;
+  const totalW = cols * stepZ + d / 2;    // extra half-diameter for the row shift
+
+  let placed = 0;
+  outer: for (let i = 0; i < rows; i++) {
+    for (let j = 0; j < cols; j++) {
+      if (placed >= totalToShow) break outer;
+      const geo = new THREE.CylinderGeometry(r, r, Math.max(l*SCALE, 0.05), 12);
+      const mat = new THREE.MeshStandardMaterial({ color, opacity: opacity ?? 0.95, transparent:true });
+      const rod = new THREE.Mesh(geo, mat);
+      rod.rotation.z = Math.PI / 2;
+      // Odd rows are shifted by d/2 - this is the hex offset that lets
+      // three rods sit in an equilateral triangle.
+      const shiftZ = (i % 2 === 1) ? d / 2 : 0;
+      rod.position.y = i * stepY + d / 2 - totalH / 2;
+      rod.position.z = j * stepZ + d / 2 + shiftZ - totalW / 2;
+      rod.add(new THREE.LineSegments(new THREE.EdgesGeometry(geo),
+        new THREE.LineBasicMaterial({ color:0x000000, opacity:0.25, transparent:true })));
+      group.add(rod);
+      placed++;
+    }
+  }
+  return group;
+}
+
+// A flat plate/sheet - drawn as a stack of thin slabs (with a visible gap
+// between them) instead of one solid block, so a bundle of steel sheets
+// actually reads as sheets rather than a brick.
+function makePlateStack(l, w, singleThickness, qty, color, opacity) {
+  const group = new THREE.Group();
+  const shownCount = Math.max(1, Math.min(qty, 16)); // cap for performance/clarity
+  const totalHeight = singleThickness * qty * SCALE;
+  const slabHeight = totalHeight / shownCount;
+  const gap = slabHeight * 0.15;
+  const slabDrawHeight = Math.max(slabHeight - gap, 0.01);
+
+  for (let i = 0; i < shownCount; i++) {
+    const geo = new THREE.BoxGeometry(Math.max(l*SCALE,0.05), slabDrawHeight, Math.max(w*SCALE,0.05));
+    const mat = new THREE.MeshStandardMaterial({ color, opacity: opacity ?? 0.95, transparent:true });
+    const slab = new THREE.Mesh(geo, mat);
+    slab.position.y = i * slabHeight + slabDrawHeight/2;
+    slab.add(new THREE.LineSegments(new THREE.EdgesGeometry(geo),
+      new THREE.LineBasicMaterial({ color:0x000000, opacity:0.3, transparent:true })));
+    group.add(slab);
+  }
+  // group's own origin sits at the BOTTOM of the stack; shift so the
+  // group's center matches every other shape's convention (center = origin)
+  group.position.y = -totalHeight/2;
+  return group;
+}
+
+// Real I-beam cross-section, extruded along the length axis - not a box
+// with a hint, an actual I-shaped solid (flange, web, flange).
+function makeIBeam(l, h, w, color, opacity) {
+  const L = Math.max(l*SCALE, 0.05), H = Math.max(h*SCALE, 0.06), W = Math.max(w*SCALE, 0.06);
+  const flangeT = Math.max(H * 0.12, 0.015);
+  const webT = Math.max(W * 0.18, 0.015);
+  const hw = W / 2, hh = H / 2;
+
+  const shape = new THREE.Shape();
+  shape.moveTo(-hw, hh);
+  shape.lineTo(hw, hh);
+  shape.lineTo(hw, hh - flangeT);
+  shape.lineTo(webT / 2, hh - flangeT);
+  shape.lineTo(webT / 2, -hh + flangeT);
+  shape.lineTo(hw, -hh + flangeT);
+  shape.lineTo(hw, -hh);
+  shape.lineTo(-hw, -hh);
+  shape.lineTo(-hw, -hh + flangeT);
+  shape.lineTo(-webT / 2, -hh + flangeT);
+  shape.lineTo(-webT / 2, hh - flangeT);
+  shape.lineTo(-hw, hh - flangeT);
+  shape.closePath();
+
+  return extrudeAlongLength(shape, L, color, opacity);
+}
+
+// Real C-channel cross-section (web on one side, flanges folding in) -
+// used for purlins/channels, extruded along the length axis.
+function makeChannel(l, h, w, color, opacity) {
+  const L = Math.max(l*SCALE, 0.05), H = Math.max(h*SCALE, 0.06), W = Math.max(w*SCALE, 0.06);
+  const flangeT = Math.max(H * 0.12, 0.015);
+  const webT = Math.max(W * 0.18, 0.015);
+  const hw = W / 2, hh = H / 2;
+
+  const shape = new THREE.Shape();
+  shape.moveTo(-hw, hh);
+  shape.lineTo(hw, hh);
+  shape.lineTo(hw, hh - flangeT);
+  shape.lineTo(-hw + webT, hh - flangeT);
+  shape.lineTo(-hw + webT, -hh + flangeT);
+  shape.lineTo(hw, -hh + flangeT);
+  shape.lineTo(hw, -hh);
+  shape.lineTo(-hw, -hh);
+  shape.closePath();
+
+  return extrudeAlongLength(shape, L, color, opacity);
+}
+
+// Mirror of a C-channel: web on the RIGHT side (positive x), opening
+// facing LEFT (negative x). When a normal C (opening right) and this
+// mirror C are placed side by side with their flange tips meeting, the
+// pair forms a closed rectangular box - the real "box nesting" pattern
+// used when C-channels are packed for shipping.
+function makeChannelMirror(l, h, w, color, opacity) {
+  const L = Math.max(l*SCALE, 0.05), H = Math.max(h*SCALE, 0.06), W = Math.max(w*SCALE, 0.06);
+  const flangeT = Math.max(H * 0.12, 0.015);
+  const webT = Math.max(W * 0.18, 0.015);
+  const hw = W / 2, hh = H / 2;
+
+  const shape = new THREE.Shape();
+  shape.moveTo(hw, hh);
+  shape.lineTo(-hw, hh);
+  shape.lineTo(-hw, hh - flangeT);
+  shape.lineTo(hw - webT, hh - flangeT);
+  shape.lineTo(hw - webT, -hh + flangeT);
+  shape.lineTo(-hw, -hh + flangeT);
+  shape.lineTo(-hw, -hh);
+  shape.lineTo(hw, -hh);
+  shape.closePath();
+
+  return extrudeAlongLength(shape, L, color, opacity);
+}
+
+// Shared helper: extrudes a 2D cross-section (drawn in width x height) along
+// the length axis and rotates it so length lines up with world X, matching
+// every other shape's convention of "position = the piece's own center".
+function extrudeAlongLength(shape, length, color, opacity) {
+  const geo = new THREE.ExtrudeGeometry(shape, { depth: length, bevelEnabled: false });
+  geo.translate(0, 0, -length / 2);
+  const mat = new THREE.MeshStandardMaterial({ color, opacity: opacity ?? 0.95, transparent:true, side: THREE.DoubleSide });
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.rotation.y = Math.PI / 2;
+  mesh.add(new THREE.LineSegments(new THREE.EdgesGeometry(geo),
+    new THREE.LineBasicMaterial({ color:0x000000, opacity:0.3, transparent:true })));
+  return mesh;
+}
+
+// Real Z-purlin cross-section - a true Z shape when viewed end-on.
+// Top flange extends RIGHT of the vertical web at the top, bottom flange
+// extends LEFT of the web at the bottom. Common in cold-formed steel
+// (Tekla writes them as "200Z18", "150Z12" in part Description).
+function makeZChannel(l, h, w, color, opacity) {
+  const L = Math.max(l*SCALE, 0.05), H = Math.max(h*SCALE, 0.06), W = Math.max(w*SCALE, 0.06);
+  const flangeT = Math.max(H * 0.10, 0.015);
+  const webT    = Math.max(W * 0.15, 0.015);
+  const hw = W / 2, hh = H / 2;
+
+  const shape = new THREE.Shape();
+  shape.moveTo(-webT/2, hh);
+  shape.lineTo(hw, hh);
+  shape.lineTo(hw, hh - flangeT);
+  shape.lineTo(webT/2, hh - flangeT);
+  shape.lineTo(webT/2, -hh);
+  shape.lineTo(-hw, -hh);
+  shape.lineTo(-hw, -hh + flangeT);
+  shape.lineTo(-webT/2, -hh + flangeT);
+  shape.closePath();
+
+  return extrudeAlongLength(shape, L, color, opacity);
+}
+
+// Mirror of a Z-purlin (an "S-shape"): top flange extends LEFT, bottom
+// flange extends RIGHT. Placed alongside the normal Z, the mirror-Z's
+// flanges slot into the concave corners of the Z — the classic contour
+// nesting used when stacking Z-purlins in a warehouse.
+// Real Z has C₂ rotational symmetry around its length axis, so rotating a
+// Z 180° gives the same shape - that's why an explicit mirror polygon is
+// required for the interlocking pattern.
+function makeZChannelMirror(l, h, w, color, opacity) {
+  const L = Math.max(l*SCALE, 0.05), H = Math.max(h*SCALE, 0.06), W = Math.max(w*SCALE, 0.06);
+  const flangeT = Math.max(H * 0.10, 0.015);
+  const webT    = Math.max(W * 0.15, 0.015);
+  const hw = W / 2, hh = H / 2;
+
+  // Mirror-Z: reflect every x-coordinate of the normal Z polygon in place.
+  const shape = new THREE.Shape();
+  shape.moveTo(webT/2, hh);
+  shape.lineTo(-hw, hh);
+  shape.lineTo(-hw, hh - flangeT);
+  shape.lineTo(-webT/2, hh - flangeT);
+  shape.lineTo(-webT/2, -hh);
+  shape.lineTo(hw, -hh);
+  shape.lineTo(hw, -hh + flangeT);
+  shape.lineTo(webT/2, -hh + flangeT);
+  shape.closePath();
+
+  return extrudeAlongLength(shape, L, color, opacity);
+}
+
+// L-angle cross-section - two perpendicular legs meeting at one corner.
+// Tekla writes these as "L40*2.5", "L50*5" (leg × thickness) in the
+// part Description. Very common as bracing/gusset material.
+function makeLAngle(l, h, w, color, opacity) {
+  const L = Math.max(l*SCALE, 0.05), H = Math.max(h*SCALE, 0.06), W = Math.max(w*SCALE, 0.06);
+  // legs are perpendicular; use min-side thickness so the shape is
+  // visually solid but still recognisably an angle
+  const t = Math.max(Math.min(H, W) * 0.18, 0.015);
+  const hw = W / 2, hh = H / 2;
+
+  // Vertical leg on the LEFT (left edge full height), horizontal leg
+  // along the BOTTOM (full width). Traced clockwise from top-left.
+  const shape = new THREE.Shape();
+  shape.moveTo(-hw, hh);
+  shape.lineTo(-hw + t, hh);
+  shape.lineTo(-hw + t, -hh + t);
+  shape.lineTo(hw, -hh + t);
+  shape.lineTo(hw, -hh);
+  shape.lineTo(-hw, -hh);
+  shape.closePath();
+
+  return extrudeAlongLength(shape, L, color, opacity);
+}
+
+// Rectangular hollow section (SHS/RHS tube) - real hollow rectangular
+// tube with a wall thickness.
+function makeRHS(l, h, w, color, opacity) {
+  const L = Math.max(l*SCALE, 0.05), H = Math.max(h*SCALE, 0.06), W = Math.max(w*SCALE, 0.06);
+  const t = Math.max(Math.min(H, W) * 0.10, 0.015);
+  const hw = W / 2, hh = H / 2;
+
+  const outer = new THREE.Shape();
+  outer.moveTo(-hw, hh);
+  outer.lineTo(hw, hh);
+  outer.lineTo(hw, -hh);
+  outer.lineTo(-hw, -hh);
+  outer.closePath();
+
+  if (hw - t > 0 && hh - t > 0) {
+    const hole = new THREE.Path();
+    hole.moveTo(-hw + t, hh - t);
+    hole.lineTo(hw - t, hh - t);
+    hole.lineTo(hw - t, -hh + t);
+    hole.lineTo(-hw + t, -hh + t);
+    hole.closePath();
+    outer.holes.push(hole);
+  }
+
+  return extrudeAlongLength(outer, L, color, opacity);
+}
+
+// Parses Tekla's part Description string into a profile shape descriptor.
+// Handles the common patterns found in real ACERO IFC exports:
+//   "200Z18", "150Z12"   -> Z-purlin
+//   "200C25", "120C20"   -> C-channel (cold-formed)
+//   "L40*2.5", "L50X5"   -> L-angle
+//   "PL5*150", "PL10X75" -> plate
+//   "ROD12", "ROD20", "D24" -> round rod
+//   "H100*50", "IPE300"  -> I-beam
+//   "SHS100", "RHS100X50" -> hollow tube
+// Returns null for unrecognised strings (falls back to name-based guess).
+function detectFromDescription(desc) {
+  if (!desc || typeof desc !== 'string') return null;
+  const d = desc.trim().toUpperCase();
+
+  if (/HEX_?NUT|WASHER|BOLT|SCREW|NUT_?WASHER/.test(d)) return null;
+  if (/^PL\s*\d+(?:\.\d+)?\s*[X*]\s*\d/.test(d)) return { shape: 'plate' };
+  if (/^(?:ROD|D)\s*\d+(?:\.\d+)?(?:$|_)/.test(d)) return { shape: 'rod' };
+  if (/^\d+\s*Z\s*\d/.test(d)) return { shape: 'z_channel' };
+  if (/^\d+\s*C\s*\d/.test(d)) return { shape: 'c_channel' };
+  if (/^L\s*\d+(?:\.\d+)?\s*[X*]\s*\d/.test(d)) return { shape: 'l_angle' };
+  if (/^(?:SHS|RHS)\s*\d/.test(d)) return { shape: 'rhs' };
+  if (/^(?:H|IPE|HEA|HEB|UB|UC|W)\s*\d/.test(d)) return { shape: 'i_beam' };
+
+  return null;
+}
+
+// Fallback: guess a shape from the assembly name when the part Description
+// wasn't available (e.g. older build without Description extraction, or a
+// non-Tekla IFC exporter). Tekla naming conventions used at ACERO:
+//   ROD_BRACE_ASSY / BRACE_ROD -> rod
+//   GIRT / PURLIN               -> Z-purlin (most common cold-formed)
+//   ANGLE / L_BRACE             -> L-angle
+//   PLT / PLATE / SHIM / SHEET / FLANGE -> plate
+//   COLUMN / RAFTER / BEAM / TUBE -> I-beam
+function detectFromName(name) {
+  if (!name || typeof name !== 'string') return null;
+  const n = name.toUpperCase();
+  if (/ROD_?BRACE|BRACE_?ROD|^ROD/.test(n)) return { shape: 'rod' };
+  if (/GIRT|PURLIN/.test(n)) return { shape: 'z_channel' };
+  if (/L_?ANGLE|^ANGLE/.test(n)) return { shape: 'l_angle' };
+  if (/PLT|PLATE|SHIM|SHEET|FLANGE|STIFFENER|END_?PLT/.test(n)) return { shape: 'plate' };
+  if (/COLUMN|RAFTER|^BEAM|^TUBE/.test(n)) return { shape: 'i_beam' };
+  return null;
+}
+
+// Combined: try the exact Description first, then fall back to the
+// assembly-name convention. Returns null only when both fail.
+function detectProfileShape(desc, assemblyName) {
+  return detectFromDescription(desc) || detectFromName(assemblyName);
+}
+
+// A bundle of nested channels shown as several flat slabs offset from each
+// other - visually cleaner than trying to render each full extrusion, and
+// clearly shows the "tucked-inside-each-other" stacking pattern.
+// A bundle of N identical C-channels arranged in a rows × cols grid,
+// matching how they actually ship (see reference photo: multiple rows
+// stacked, several channels per row, each channel a real C cross-section).
+// Each channel is a real makeChannel extrusion at its own grid slot.
+// C-channel bundle - real "Box Nesting". Each grid slot holds ONE PAIR:
+// a normal C (web left, opening right) and a mirror C (web right, opening
+// left) drawn at the SAME position. The two webs form the outer left/right
+// walls of the box, and the flange tips meet exactly in the middle - the
+// pair renders as a closed rectangular tube with zero interior gap.
+// Pairs are then tiled tightly across rows × cols with no space between
+// outer faces. If qty is odd, the last unpaired C is drawn on its own.
+function makeChannelBundle(l, unitH, unitW, cols, rows, qty, color, opacity) {
+  const group = new THREE.Group();
+  const numPairs = Math.floor(qty / 2);
+  const hasSingle = (qty % 2) === 1;
+  const totalSlots = numPairs + (hasSingle ? 1 : 0);
+  const slotsToShow = Math.min(totalSlots, 60);
+
+  const stepY = unitH * SCALE;
+  const stepZ = unitW * SCALE;
+  const totalH = rows * stepY;
+  const totalW = cols * stepZ;
+
+  let placed = 0;
+  outer: for (let i = 0; i < rows; i++) {
+    for (let j = 0; j < cols; j++) {
+      if (placed >= slotsToShow) break outer;
+      const posY = i * stepY + stepY/2 - totalH/2;
+      const posZ = j * stepZ + stepZ/2 - totalW/2;
+
+      const cNorm = makeChannel(l, unitH, unitW, color, opacity);
+      cNorm.position.y = posY;
+      cNorm.position.z = posZ;
+      group.add(cNorm);
+
+      // If this slot has a paired C, overlay the mirror at the same
+      // position so their flange tips meet in the middle - forms a closed
+      // rectangular tube.
+      const isPaired = placed < numPairs;
+      if (isPaired) {
+        const cMirror = makeChannelMirror(l, unitH, unitW, color, opacity);
+        cMirror.position.y = posY;
+        cMirror.position.z = posZ;
+        group.add(cMirror);
+      }
+      placed++;
+    }
+  }
+  return group;
+}
+
+// Router: picks the right shape function per item. If a real profile
+// shape was detected from the IFC part Description (z_channel, c_channel,
+// l_angle, i_beam, plate, rod, rhs), that always wins over the raw
+// category guess. Bundle grids continue to work for all shape types.
+function makeShape(it, color, opacity) {
+  const p = it.profileShape;
+
+  if (p === 'z_channel') {
+    if (it.gridCols && it.gridRows && it.qty > 1)
+      return makeShapeBundle(makeZChannel, it, color, opacity);
+    return makeZChannel(it.lengthMm, it.heightMm, it.widthMm, color, opacity);
+  }
+  if (p === 'l_angle') {
+    if (it.gridCols && it.gridRows && it.qty > 1)
+      return makeShapeBundle(makeLAngle, it, color, opacity);
+    return makeLAngle(it.lengthMm, it.heightMm, it.widthMm, color, opacity);
+  }
+  if (p === 'rhs') {
+    if (it.gridCols && it.gridRows && it.qty > 1)
+      return makeShapeBundle(makeRHS, it, color, opacity);
+    return makeRHS(it.lengthMm, it.heightMm, it.widthMm, color, opacity);
+  }
+  if (p === 'c_channel') {
+    if (it.gridCols && it.gridRows && it.qty > 1)
+      return makeChannelBundle(it.channelLength || it.lengthMm, it.unitHeight, it.unitWidth, it.gridCols, it.gridRows, it.qty, color, opacity);
+    return makeChannel(it.lengthMm, it.heightMm, it.widthMm, color, opacity);
+  }
+  if (p === 'i_beam') {
+    if (it.gridCols && it.gridRows && it.qty > 1)
+      return makeBeamBundle(it.lengthMm, it.unitHeight, it.unitWidth, it.gridCols, it.gridRows, it.qty, color, opacity);
+    return makeIBeam(it.lengthMm, it.heightMm, it.widthMm, color, opacity);
+  }
+  if (p === 'rod') {
+    if (it.bundled && it.unitDiam && it.gridCols && it.gridRows)
+      return makeRodBundle(it.lengthMm, it.unitDiam, it.gridCols, it.gridRows, it.qty, color, opacity);
+    return makeRod(it.lengthMm, it.heightMm, it.widthMm, color, opacity);
+  }
+  if (p === 'plate') {
+    if (it.stacked) {
+      const t = it.unitThickness || (it.heightMm / Math.max(it.qty, 1));
+      return makePlateStack(it.lengthMm, it.widthMm, t, it.qty, color, opacity);
+    }
+    return makeBox(it.lengthMm, it.heightMm, it.widthMm, color, opacity);
+  }
+
+  // Fallback to category-based routing when no profile was detected
+  if (it.category === 'rod') {
+    if (it.bundled && it.unitDiam && it.gridCols && it.gridRows)
+      return makeRodBundle(it.lengthMm, it.unitDiam, it.gridCols, it.gridRows, it.qty, color, opacity);
+    return makeRod(it.lengthMm, it.heightMm, it.widthMm, color, opacity);
+  }
+  if (it.category === 'plate') {
+    if (it.stacked) {
+      const t = it.unitThickness || (it.heightMm / Math.max(it.qty, 1));
+      return makePlateStack(it.lengthMm, it.widthMm, t, it.qty, color, opacity);
+    }
+    return makeBox(it.lengthMm, it.heightMm, it.widthMm, color, opacity);
+  }
+  if (it.category === 'beam') {
+    if (it.beamBundle && it.unitHeight && it.unitWidth && it.gridCols && it.gridRows)
+      return makeBeamBundle(it.lengthMm, it.unitHeight, it.unitWidth, it.gridCols, it.gridRows, it.qty, color, opacity);
+    return makeIBeam(it.lengthMm, it.heightMm, it.widthMm, color, opacity);
+  }
+  if (it.category === 'purlin') {
+    if (it.nested && it.unitWidth && it.unitHeight && it.gridCols && it.gridRows) {
+      const cl = it.channelLength || it.lengthMm;
+      return makeChannelBundle(cl, it.unitHeight, it.unitWidth, it.gridCols, it.gridRows, it.qty, color, opacity);
+    }
+    return makeChannel(it.lengthMm, it.heightMm, it.widthMm, color, opacity);
+  }
+  return makeBox(it.lengthMm, it.heightMm, it.widthMm, color, opacity);
+}
+
+// Shared bundle helper: takes a shape-making function (makeLAngle,
+// makeRHS, ...) and lays out qty instances in a rows × cols grid so any
+// profile family gets the same "real bundle of N" rendering treatment.
+// Each piece is a real extrusion of its true cross-section.
+//
+// Z-purlin special case ("Contour Nesting"): each grid slot renders ONE
+// PAIR - a normal Z (top flange right, bottom flange left) and a mirror
+// Z (top flange left, bottom flange right) drawn at the SAME position.
+// The two shapes fill each other's concave corners: together the pair
+// completely fills a single unitW × unitH bounding box. Pairs are then
+// tiled tightly across rows × cols with zero gaps between outer faces.
+// Real Z has C₂ rotational symmetry around its length axis so rotating
+// a Z 180° gives back the same Z - an explicit mirror polygon is
+// required for the interlocking to actually show.
+function makeShapeBundle(shapeFn, it, color, opacity) {
+  const group = new THREE.Group();
+  const cols = it.gridCols, rows = it.gridRows;
+  const unitH = it.unitHeight, unitW = it.unitWidth;
+  const isZ = it.profileShape === 'z_channel';
+
+  const stepY = unitH * SCALE;
+  const stepZ = unitW * SCALE;
+  const totalH = rows * stepY;
+  const totalW = cols * stepZ;
+
+  // Z pairs share one slot; other profiles use one slot per piece.
+  const totalToShow = isZ
+    ? Math.min(Math.ceil(it.qty / 2), 60)
+    : Math.min(it.qty, 100);
+
+  let placed = 0;
+  outer: for (let i = 0; i < rows; i++) {
+    for (let j = 0; j < cols; j++) {
+      if (placed >= totalToShow) break outer;
+      const posY = i * stepY + stepY/2 - totalH/2;
+      const posZ = j * stepZ + stepZ/2 - totalW/2;
+
+      const piece = shapeFn(it.lengthMm, unitH, unitW, color, opacity);
+      piece.position.y = posY;
+      piece.position.z = posZ;
+      group.add(piece);
+
+      if (isZ) {
+        // Overlay the mirror-Z at the SAME position - together the two
+        // Z shapes fit into each other's concave corners like keys into
+        // a lock, filling one unit bounding box completely.
+        const mirror = makeZChannelMirror(it.lengthMm, unitH, unitW, color, opacity);
+        mirror.position.y = posY;
+        mirror.position.z = posZ;
+        group.add(mirror);
+      }
+      placed++;
+    }
+  }
+  return group;
+}
+
+// A bundle of N identical I-beams arranged in a rows × cols grid, each
+// beam a real I-section extrusion. When qty is small this looks like a
+// simple vertical stack; larger qtys become multiple columns of stacks
+// (matching how a container-load of identical rafters actually ships).
+function makeBeamBundle(l, unitH, unitW, cols, rows, qty, color, opacity) {
+  const group = new THREE.Group();
+  const totalToShow = Math.min(qty, 60);
+  const stepY = unitH * SCALE;
+  const stepZ = unitW * SCALE;
+  const totalH = rows * stepY;
+  const totalW = cols * stepZ;
+
+  let placed = 0;
+  outer: for (let i = 0; i < rows; i++) {
+    for (let j = 0; j < cols; j++) {
+      if (placed >= totalToShow) break outer;
+      const beam = makeIBeam(l, unitH, unitW, color, opacity);
+      beam.position.y = i * stepY + stepY/2 - totalH/2;
+      beam.position.z = j * stepZ + stepZ/2 - totalW/2;
+      group.add(beam);
+      placed++;
+    }
+  }
+  return group;
+}
+
+// ------------------------------------------------------------------
+// DATA HELPERS
+// ------------------------------------------------------------------
+
+const ABS_MAX_MM = 50000;
+const ABS_MAX_KG = 50000;
+
+function findDataProblems(it) {
+  const problems = [];
+  const checkDim = (val, label) => {
+    if (!isFinite(val) || val === null || val === undefined) problems.push(`${label} is missing/invalid`);
+    else if (val <= 0) problems.push(`${label} is ${val} (must be > 0)`);
+    else if (val > ABS_MAX_MM) problems.push(`${label} is ${Math.round(val)}mm - exceeds ${ABS_MAX_MM}mm sanity limit`);
+  };
+  checkDim(it.lengthMm, 'length');
+  checkDim(it.widthMm, 'width');
+  checkDim(it.heightMm, 'height');
+  if (!isFinite(it.unitWeightKg) || it.unitWeightKg === null || it.unitWeightKg === undefined)
+    problems.push('weight is missing/invalid');
+  else if (it.unitWeightKg <= 0) problems.push(`weight is ${it.unitWeightKg} (must be > 0)`);
+  else if (it.unitWeightKg > ABS_MAX_KG) problems.push(`weight is ${Math.round(it.unitWeightKg)}kg - exceeds sanity limit`);
+  return problems;
+}
+
+// Real fill factors (steel volume ÷ bounding-box volume) for common
+// structural profiles. Only applied when the C# side flagged the weight
+// as "estimated from geometry" - i.e. the IFC had no property-set weight
+// and we fell back to bounding-box × steel-density (7850 kg/m³). For a
+// cold-formed Z-purlin that's off by ~50× because a Z is mostly air.
+// Values are conservative averages across common gauges.
+const FILL_FACTORS = {
+  plate:     1.00,   // solid sheet
+  rod:       1.00,   // solid bar
+  z_channel: 0.08,   // cold-formed Z, thin walls
+  c_channel: 0.08,   // cold-formed C
+  l_angle:   0.15,   // hot-rolled L, thicker
+  i_beam:    0.20,   // hot-rolled I
+  rhs:       0.30    // rectangular hollow section
+};
+
+function applyWeightCorrection(items) {
+  items.forEach(it => {
+    if (!it.weightEstimated) return;             // real property-set weight → trust it
+    const detected = detectProfileShape(it.profileDesc, it.assemblyName);
+    const shape = detected ? detected.shape : null;
+    const fill = shape && FILL_FACTORS[shape] !== undefined
+      ? FILL_FACTORS[shape]
+      : 0.35;                                     // safe default for unknown thin-walled
+    it.unitWeightKg = it.unitWeightKg * fill;
+    it._weightCorrected = true;
+  });
+}
+
+function validateRawItems(items) {
+  applyWeightCorrection(items);
+  const valid = [], issues = [];
+  items.forEach(it => {
+    const problems = findDataProblems(it);
+    if (problems.length > 0) issues.push({ mark:it.mark, assemblyName:it.assemblyName, qty:it.qty,
+      lengthMm:it.lengthMm, widthMm:it.widthMm, heightMm:it.heightMm, unitWeightKg:it.unitWeightKg, problems });
+    else valid.push(it);
+  });
+  return { valid, issues };
+}
+
+const CHANNEL_NEST_FACTOR = 0.35;
+
+// Expand items into packable units. Real-world grouping rules:
+//   - Plates same-mark  -> ONE stacked bundle (thickness × qty)
+//   - Purlins/channels same-mark -> ONE nested bundle (C-sections tuck inside each other)
+//   - Rods same-mark -> ONE bundled bunch (arranged in a compact grid pattern, strapped)
+//   - Beams same-mark -> ONE side-by-side bundle (stacked in a column with dunnage)
+//   - Anything else with qty > 1 -> ONE bundled group at the same section
+// Individual same-mark items are almost never loaded loose - they arrive at
+// the container as pre-bundled units, so packing them one-at-a-time is
+// what wastes space.
+function expandUnits(items, spec) {
+  const units = [];
+  const groups = {};
+
+  items.forEach(it => {
+    // Detect the true cross-section shape - first from the IFC part
+    // Description (most reliable), then from the assembly name convention
+    // as a fallback. If both fail we leave profileShape null and let the
+    // category-based routing handle it.
+    const detected = detectProfileShape(it.profileDesc, it.assemblyName);
+    const profileShape = detected ? detected.shape : null;
+
+    // Include shape in the group key so, e.g., two "GR001" items with
+    // different profiles (unlikely but possible) don't collapse together.
+    const key = `${it.category}|${profileShape || '-'}|${it.mark}|${Math.round(it.lengthMm)}|${Math.round(it.widthMm)}|${Math.round(it.heightMm)}`;
+    if (!groups[key]) {
+      groups[key] = {
+        mark: it.mark, assemblyName: it.assemblyName, category: it.category,
+        profileShape,
+        l: it.lengthMm, w: it.widthMm, h: it.heightMm,
+        weight: 0, qty: 0
+      };
+    }
+    groups[key].qty += it.qty;
+    groups[key].weight += it.qty * it.unitWeightKg;
+  });
+
+  // Pick the (cols, rows) grid whose bundle bounding box is the most compact
+  // (lowest max(width, height)) for the given qty. Prefers exact grids
+  // (cols*rows == qty) so the render doesn't show empty slots.
+  function bestGrid(qty, unitW, unitH) {
+    let bestCols = 1, bestRows = qty;
+    let bestMax = Infinity;
+    let foundExact = false;
+    for (let cols = 1; cols <= qty; cols++) {
+      const rows = Math.ceil(qty / cols);
+      const w = cols * unitW;
+      const h = rows * unitH;
+      const maxDim = Math.max(w, h);
+      const isExact = (cols * rows === qty);
+      // Exact grids always beat non-exact ones. Within either bucket,
+      // smaller max-dimension wins.
+      const beats = (isExact && !foundExact) ||
+                    (isExact === foundExact && maxDim < bestMax);
+      if (beats) {
+        bestMax = maxDim; bestCols = cols; bestRows = rows;
+        if (isExact) foundExact = true;
+      }
+    }
+    return { cols: bestCols, rows: bestRows };
+  }
+
+  // Build one bundle for a given (mark, qty). Bundle geometry matches the
+  // renderer's exact grid so the packer math is consistent with what the
+  // user sees.
+  function makeBundle(g, qty) {
+    const weight = g.weight * (qty / g.qty);
+    const base = { mark:g.mark, assemblyName:g.assemblyName,
+                   category:g.category, profileShape:g.profileShape };
+
+    if (qty === 1) {
+      return { ...base, l:g.l, w:g.w, h:g.h, weight, qty:1, stacked:false };
+    }
+
+    // Route by DETECTED shape first, then by category as fallback. Shape
+    // dictates both the bundling math and the render.
+    const p = g.profileShape || null;
+
+    // PLATES: always stack flat (thickness × qty), same L × W footprint.
+    if (p === 'plate' || (!p && g.category === 'plate')) {
+      return { ...base, category:'plate',
+        l:g.l, w:g.w, h:g.h * qty, weight,
+        qty, stacked:true, unitThickness:g.h };
+    }
+
+    // RODS: compact 2D grid of round bars.
+    if (p === 'rod' || (!p && g.category === 'rod')) {
+      const d = Math.max(g.w, g.h);
+      const { cols, rows } = bestGrid(qty, d, d);
+      return { ...base, category:'rod',
+        l:g.l, w:cols * d, h:rows * d, weight, qty,
+        stacked:true, bundled:true, unitDiam:d,
+        unitWidth:d, unitHeight:d,
+        gridCols:cols, gridRows:rows };
+    }
+
+    // C-CHANNELS (cold-formed purlins): 2D grid of PAIRS. Each cell holds
+    // one nested pair (normal C + mirror C = closed rectangular box, no
+    // interior gap). Bundle size = cols × rows × unitW × unitH.
+    if (p === 'c_channel' || (!p && g.category === 'purlin')) {
+      const numPairs = Math.ceil(qty / 2);
+      const { cols, rows } = bestGrid(numPairs, g.w, g.h);
+      return { ...base, category:'purlin',
+        l:g.l, w:cols * g.w, h:rows * g.h, weight, qty,
+        stacked:true, nested:true,
+        unitWidth:g.w, unitHeight:g.h,
+        gridCols:cols, gridRows:rows,
+        channelLength:g.l, channelHeight:g.h };
+    }
+
+    // Z-PURLINS: 2D grid of PAIRS. Each grid cell holds one nested pair
+    // (normal Z + mirror Z overlapping = one filled unit bounding box).
+    // The whole bundle is grid_of_pairs sized in cols × rows × unitW × unitH.
+    if (p === 'z_channel') {
+      const numPairs = Math.ceil(qty / 2);
+      const { cols, rows } = bestGrid(numPairs, g.w, g.h);
+      return { ...base, category:'purlin',
+        l:g.l, w:cols * g.w, h:rows * g.h, weight, qty,
+        stacked:true, nested:true,
+        unitWidth:g.w, unitHeight:g.h,
+        gridCols:cols, gridRows:rows };
+    }
+
+    // L-ANGLES: 2D grid, real L cross-section.
+    if (p === 'l_angle') {
+      const { cols, rows } = bestGrid(qty, g.w, g.h);
+      return { ...base,
+        l:g.l, w:cols * g.w, h:rows * g.h, weight, qty,
+        stacked:true, nested:true,
+        unitWidth:g.w, unitHeight:g.h,
+        gridCols:cols, gridRows:rows };
+    }
+
+    // RHS (hollow tube): 2D grid.
+    if (p === 'rhs') {
+      const { cols, rows } = bestGrid(qty, g.w, g.h);
+      return { ...base,
+        l:g.l, w:cols * g.w, h:rows * g.h, weight, qty,
+        stacked:true, nested:true,
+        unitWidth:g.w, unitHeight:g.h,
+        gridCols:cols, gridRows:rows };
+    }
+
+    // I-BEAMS / everything else: 2D grid, real I cross-section.
+    const { cols, rows } = bestGrid(qty, g.w, g.h);
+    return { ...base,
+      l:g.l, w:cols * g.w, h:rows * g.h, weight,
+      qty, stacked:true, beamBundle:true,
+      unitWidth:g.w, unitHeight:g.h,
+      gridCols:cols, gridRows:rows };
+  }
+
+  // Does this bundle fit inside the container (dimensions, weight, AND
+  // layer budget)? A bundle taller than ~40% of the container ceiling
+  // is rejected here so splitIfNeeded is forced to break it into smaller
+  // sub-bundles - otherwise a single tall stack blocks the middle and
+  // top layers from ever forming above it.
+  function bundleFits(bundle) {
+    if (!spec) return true;
+    if (bundle.weight > spec.maxWeightKg + 1e-6) return false;
+    // Height budget: no single bundle taller than 1000mm or 40% of
+    // container height (whichever is smaller). Leaves room for the
+    // beam layer at the floor, purlin layer in the middle, and
+    // plate/rod layer on top.
+    const maxBundleH = Math.min(spec.heightMm * 0.4, 1000);
+    const dims = [bundle.l, bundle.w, bundle.h];
+    const cont = [spec.lengthMm, spec.widthMm, maxBundleH];
+    const perms = [[0,1,2],[0,2,1],[1,0,2],[1,2,0],[2,0,1],[2,1,0]];
+    for (const [i,j,k] of perms) {
+      if (dims[i] <= cont[0]+1e-6 && dims[j] <= cont[1]+1e-6 && dims[k] <= cont[2]+1e-6)
+        return true;
+    }
+    return false;
+  }
+
+  // If the full-qty bundle doesn't fit (too big or too heavy), split it into
+  // the smallest number of equal sub-bundles that each fit. Binary search
+  // finds the largest per-bundle qty that fits.
+  function splitIfNeeded(g) {
+    const full = makeBundle(g, g.qty);
+    if (bundleFits(full)) return [full];
+    if (g.qty <= 1) return [full];
+
+    let lo = 1, hi = g.qty - 1, best = 1;
+    while (lo <= hi) {
+      const mid = Math.floor((lo + hi) / 2);
+      if (bundleFits(makeBundle(g, mid))) { best = mid; lo = mid + 1; }
+      else hi = mid - 1;
+    }
+
+    const out = [];
+    let remaining = g.qty;
+    let idx = 0;
+    while (remaining > 0) {
+      const take = Math.min(best, remaining);
+      const b = makeBundle(g, take);
+      if (g.qty !== take) b.mark = g.mark + '-p' + (++idx);
+      out.push(b);
+      remaining -= take;
+    }
+    return out;
+  }
+
+  Object.values(groups).forEach(g => {
+    splitIfNeeded(g).forEach(b => units.push(b));
+  });
+
+  return units;
+}
+
+function layoutQuick(items, spec) {
+  const units = expandUnits(items, spec);
+  const oversized = units.filter(u => u.l>spec.lengthMm || u.w>spec.widthMm || u.h>spec.heightMm);
+  const normal = units.filter(u => !oversized.includes(u)).sort((a,b) => b.weight - a.weight);
+
+  const containers = [];
+  normal.forEach(u => {
+    let t = containers.find(c => c.weightUsed + u.weight <= spec.maxWeightKg);
+    if (!t) { t = { weightUsed:0, volumeUsed:0, units:[] }; containers.push(t); }
+    t.units.push(u); t.weightUsed += u.weight; t.volumeUsed += u.l*u.w*u.h;
+  });
+
+  const cv = spec.lengthMm*spec.widthMm*spec.heightMm;
+  const result = containers.map((c, idx) => {
+    const byCategory = {};
+    c.units.forEach(u => (byCategory[u.category] = byCategory[u.category] || []).push(u));
+    const catNames = Object.keys(byCategory);
+    const laneWidth = spec.widthMm / catNames.length;
+    const outItems = [];
+    catNames.forEach((cat, laneIdx) => {
+      const laneZ = -spec.widthMm/2 + laneWidth*(laneIdx + 0.5);
+      const group = byCategory[cat];
+      const gap = 150;
+      const totalLen = group.reduce((s,u)=>s+u.l,0) + gap*Math.max(0, group.length-1);
+      const fit = totalLen <= 0 ? 1 : Math.min(1, (spec.lengthMm*0.96) / totalLen);
+      let cursor = 0;
+      group.forEach(u => {
+        const drawLen = u.l * fit;
+        outItems.push({
+          ...u,             // carry profileShape, gridCols/Rows, bundled, beamBundle, etc.
+          lengthMm: drawLen, widthMm: u.w, heightMm: u.h,
+          x: cursor + drawLen/2, y: u.h/2, z: laneZ,
+          unitWeightKg: u.weight
+        });
+        cursor += drawLen + gap;
+      });
+    });
+    return { containerNumber:idx+1, lengthMm:spec.lengthMm, widthMm:spec.widthMm, heightMm:spec.heightMm,
+      maxWeightKg:spec.maxWeightKg, usedWeightKg:round2(c.weightUsed),
+      weightUtilizationPct:round1(c.weightUsed/spec.maxWeightKg*100),
+      volumeUtilizationPct:round1(c.volumeUsed/cv*100), items:outItems };
+  });
+
+  return { containers:result, oversized };
+}
+
+// ------------------------------------------------------------------
+// MODE 2: OPTIMIZE PACKING - "Extreme Points" 3D bin packer.
+//
+// This is how a real dock worker actually thinks: place a piece, look at
+// the corners of what's already down, try the next piece against each of
+// those corners, put it wherever it slots in tightest.
+//
+// Algorithm:
+//   1. Every open container tracks a set of "extreme points" - the corners
+//      where a new piece could plausibly sit (starting with just (0,0,0)).
+//   2. For each piece (largest volume first), we scan every extreme point
+//      in every open container and every allowed orientation, checking:
+//        - Does it stay inside the container walls?
+//        - Does it overlap any already-placed piece? (real 3D box test)
+//        - Is the weight budget still OK?
+//      Among all valid placements we pick the one that goes lowest
+//      (floor-first, real gravity), then leftmost, then furthest back.
+//   3. When a piece is placed at (x,y,z), THREE new extreme points are
+//      added: (x+l,y,z), (x,y+h,z), (x,y,z+w). Any point buried inside a
+//      placed piece is dropped. This lets the next item slot into the gap
+//      right beside/above/behind the one just placed - exactly the
+//      "fill the leftover corner" behaviour you were describing.
+//   4. A new container is opened only when a piece genuinely doesn't fit
+//      in any orientation at any extreme point in any existing container.
+//
+// Unlike a shelf packer, this doesn't waste the huge column of empty air
+// above short pieces (rods, plate stacks) - the point on top of a 20mm rod
+// is a real placement candidate for the next tall column.
+// ------------------------------------------------------------------
+function layoutOptimized(items, spec) {
+  const units = expandUnits(items, spec);
+  const oversized = [];
+  const fitsAtAll = [];
+
+  function getOrientations(u) {
+    // Grid bundles (channel/rod/beam bundle) can ONLY use their natural
+    // orientation - rotating them would visually break the rows × cols grid
+    // pattern the renderer draws. If a bundle doesn't fit natural, it
+    // gets split into smaller ones by splitIfNeeded, not rotated.
+    // Everything else (plate stacks, single pieces) tries all 6 rotations.
+    const [l,w,h] = [u.l, u.w, u.h];
+    const orients = [];
+    const seen = new Set();
+    const add = (cl,cw,ch) => {
+      const key = Math.round(cl)+','+Math.round(cw)+','+Math.round(ch);
+      if (seen.has(key)) return;
+      if (cl <= spec.lengthMm+1e-6 && cw <= spec.widthMm+1e-6 && ch <= spec.heightMm+1e-6) {
+        seen.add(key); orients.push({l:cl, w:cw, h:ch});
+      }
+    };
+
+    const isGridBundle = u.qty > 1 && (u.nested || u.bundled || u.beamBundle);
+    if (isGridBundle) {
+      add(l, w, h);              // natural only
+      return orients;
+    }
+
+    add(l, w, h);                 // natural
+    add(l, h, w);                 // rolled 90° around L axis
+    // Full tipping (swapping L with W or H) rotates the whole piece
+    // sideways in the container. For pieces long relative to their
+    // section - beams, purlins, plate stacks - this makes no physical
+    // sense and would render inconsistently. Only allow tipping for
+    // genuinely short pieces (shorter than the container width in
+    // every dimension).
+    const maxDim = Math.max(l, w, h);
+    if (maxDim <= spec.widthMm && !u.stacked) {
+      add(w, l, h);
+      add(w, h, l);
+      add(h, l, w);
+      add(h, w, l);
+    }
+    return orients;
+  }
+
+  units.forEach(u => {
+    if (getOrientations(u).length === 0) oversized.push(u);
+    else fitsAtAll.push(u);
+  });
+
+  // Largest volume first - big items placed early when the container is
+  // empty, small items fill the leftover pockets later.
+  // Real-world load-order priority: heavy structural pieces (I-beams,
+  // H-beams, rafters, columns) go on the floor to keep centre-of-gravity
+  // low; cold-formed profiles (C-channels, Z-purlins, L-angles) sit on
+  // top of them; flat and tubular cargo (plates, rods, hollow tubes)
+  // caps the top. Ties within a layer are broken by volume descending so
+  // the largest piece of each layer goes down first.
+  function loadLayer(u) {
+    const p = u.profileShape || '';
+    const c = u.category || '';
+    if (p === 'i_beam' || c === 'beam') return 0;
+    if (p === 'c_channel' || p === 'z_channel' || p === 'l_angle' || c === 'purlin') return 1;
+    if (p === 'plate' || p === 'rod' || p === 'rhs' || c === 'plate' || c === 'rod') return 2;
+    return 1;
+  }
+  fitsAtAll.sort((a,b) =>
+    loadLayer(a) - loadLayer(b) ||
+    (b.l*b.w*b.h) - (a.l*a.w*a.h)
+  );
+
+  const containers = [];
+
+  // Axis-aligned box overlap test. Boxes are stored corner-based:
+  // (x,y,z) = minimum corner, (l,w,h) = extents.
+  function overlaps(a, b) {
+    return a.x < b.x + b.l - 1e-6 && a.x + a.l - 1e-6 > b.x &&
+           a.y < b.y + b.h - 1e-6 && a.y + a.h - 1e-6 > b.y &&
+           a.z < b.z + b.w - 1e-6 && a.z + a.w - 1e-6 > b.z;
+  }
+
+  function findPlacement(container, u) {
+    if (container.weightUsed + u.weight > spec.maxWeightKg) return null;
+    const orients = getOrientations(u);
+    const layer = loadLayer(u);
+    const minY = (layer > 0) ? (container.layerTopY[layer - 1] || 0) : 0;
+
+    // Two-pass search: pass 1 only considers EPs at or above the
+    // previous layer's top (proper layered stacking), pass 2 falls back
+    // to any Y if nothing fit up there.
+    const passes = layer > 0 ? [minY, 0] : [0];
+    for (const yFloor of passes) {
+      let best = null;
+      for (const ep of container.extremePoints) {
+        if (ep.y + 1e-6 < yFloor) continue;
+        for (const o of orients) {
+          if (ep.x + o.l > spec.lengthMm + 1e-6) continue;
+          if (ep.y + o.h > spec.heightMm + 1e-6) continue;
+          if (ep.z + o.w > spec.widthMm + 1e-6) continue;
+
+          const testBox = { x:ep.x, y:ep.y, z:ep.z, l:o.l, w:o.w, h:o.h };
+          let clash = false;
+          for (const p of container.items) {
+            if (overlaps(testBox, p._box)) { clash = true; break; }
+          }
+          if (clash) continue;
+
+          // Left-right balance: prefer the side of the centreline that
+          // currently carries less weight.
+          const halfWidth = spec.widthMm / 2;
+          const centerZ = ep.z + o.w / 2;
+          const rightSide = centerZ > halfWidth;
+          const balanceWeight = rightSide
+            ? container.rightWeight
+            : container.leftWeight;
+          const score = ep.y * 1e12 + balanceWeight * 1e6 + ep.x * 1e3 + ep.z;
+          if (!best || score < best.score) {
+            best = { ep, orient: o, score };
+          }
+        }
+      }
+      if (best) return best;
+    }
+    return null;
+  }
+
+  function place(container, u, ep, o) {
+    container.weightUsed += u.weight;
+    container.volumeUsed += o.l * o.w * o.h;
+    const box = { x:ep.x, y:ep.y, z:ep.z, l:o.l, w:o.w, h:o.h };
+
+    // Track how high each layer has been built up + running left/right
+    // weight so the next placement has correct guidance.
+    const layer = loadLayer(u);
+    container.layerTopY[layer] = Math.max(
+      container.layerTopY[layer] || 0,
+      ep.y + o.h
+    );
+    const halfWidth = spec.widthMm / 2;
+    if (ep.z + o.w / 2 > halfWidth) container.rightWeight += u.weight;
+    else                              container.leftWeight  += u.weight;
+
+    container.items.push({
+      ...u,
+      lengthMm: o.l, widthMm: o.w, heightMm: o.h,
+      x: ep.x + o.l/2,
+      y: ep.y + o.h/2,
+      z: -spec.widthMm/2 + ep.z + o.w/2,
+      unitWeightKg: u.weight,
+      _box: box
+    });
+
+    // Remove the used extreme point and any others swallowed by this piece
+    container.extremePoints = container.extremePoints.filter(p => {
+      if (Math.abs(p.x-ep.x)<1e-6 && Math.abs(p.y-ep.y)<1e-6 && Math.abs(p.z-ep.z)<1e-6) return false;
+      // drop points that now lie strictly inside the placed piece
+      if (p.x >= box.x - 1e-6 && p.x < box.x + box.l - 1e-6 &&
+          p.y >= box.y - 1e-6 && p.y < box.y + box.h - 1e-6 &&
+          p.z >= box.z - 1e-6 && p.z < box.z + box.w - 1e-6) return false;
+      return true;
+    });
+
+    // Three new corners for the next piece to slot against
+    const candidates = [
+      { x: box.x + box.l, y: box.y,          z: box.z },
+      { x: box.x,          y: box.y + box.h, z: box.z },
+      { x: box.x,          y: box.y,          z: box.z + box.w },
+    ];
+    for (const ep2 of candidates) {
+      if (ep2.x >= spec.lengthMm - 1e-6) continue;
+      if (ep2.y >= spec.heightMm - 1e-6) continue;
+      if (ep2.z >= spec.widthMm - 1e-6) continue;
+      // skip if the new EP is buried inside any existing piece
+      let buried = false;
+      for (const p of container.items) {
+        if (ep2.x >= p._box.x - 1e-6 && ep2.x < p._box.x + p._box.l - 1e-6 &&
+            ep2.y >= p._box.y - 1e-6 && ep2.y < p._box.y + p._box.h - 1e-6 &&
+            ep2.z >= p._box.z - 1e-6 && ep2.z < p._box.z + p._box.w - 1e-6) {
+          buried = true; break;
+        }
+      }
+      if (buried) continue;
+      // skip near-duplicates
+      const dup = container.extremePoints.some(p =>
+        Math.abs(p.x-ep2.x) < 1 && Math.abs(p.y-ep2.y) < 1 && Math.abs(p.z-ep2.z) < 1
+      );
+      if (!dup) container.extremePoints.push(ep2);
+    }
+  }
+
+  fitsAtAll.forEach(u => {
+    let placed = false;
+    for (const container of containers) {
+      const p = findPlacement(container, u);
+      if (p) { place(container, u, p.ep, p.orient); placed = true; break; }
+    }
+    if (!placed) {
+      // Real-world dunnage clearance: leave a 75mm gap under the heavy
+      // floor layer so forklift forks / crane slings can slide underneath
+      // for unloading. Cold-formed profiles and top-layer cargo don't
+      // need this - they land directly on the bundles below.
+      const DUNNAGE_MM = 75;
+      const startY = (loadLayer(u) === 0) ? DUNNAGE_MM : 0;
+      const container = {
+        weightUsed: 0, volumeUsed: 0, items: [],
+        extremePoints: [{ x:0, y:startY, z:0 }],
+        layerTopY: {},       // max top-Y reached by each load layer
+        leftWeight: 0,       // running weight on -Z side of centreline
+        rightWeight: 0       // running weight on +Z side of centreline
+      };
+      const orients = getOrientations(u);
+      if (!orients.length) { oversized.push(u); return; }
+      containers.push(container);
+      place(container, u, { x:0, y:startY, z:0 }, orients[0]);
+    }
+  });
+
+  const cv = spec.lengthMm*spec.widthMm*spec.heightMm;
+  const result = containers.map((c, idx) => ({
+    containerNumber:idx+1,
+    lengthMm:spec.lengthMm, widthMm:spec.widthMm, heightMm:spec.heightMm,
+    maxWeightKg:spec.maxWeightKg,
+    usedWeightKg:round2(c.weightUsed),
+    weightUtilizationPct:round1(c.weightUsed/spec.maxWeightKg*100),
+    volumeUtilizationPct:round1(c.volumeUsed/cv*100),
+    // Back-to-front loading: a real worker starts against the back wall
+    // and stacks outward toward the doors. The packer's internal x=0 is
+    // treated as the back wall - mirror every X so pieces the packer laid
+    // down "at x=0 first" end up rendered at the back of the container.
+    items: c.items.map(it => {
+      const { _box, ...clean } = it;
+      clean.x = spec.lengthMm - clean.x;
+      return clean;
+    })
+  }));
+
+  return { containers:result, oversized };
+}
+
+function round1(n) { return Math.round(n*10)/10; }
+function round2(n) { return Math.round(n*100)/100; }
+
+// ------------------------------------------------------------------
+// RENDERING (same for both modes - they produce the same shape of data)
+// ------------------------------------------------------------------
+function renderContainer(idx) {
+  clearScene();
+  currentContainerIdx = idx;
+  const cont = currentLayout.containers[idx];
+  const cL = cont.lengthMm*SCALE, cW = cont.widthMm*SCALE, cH = cont.heightMm*SCALE;
+
+  const contLine = new THREE.LineSegments(
+    new THREE.EdgesGeometry(new THREE.BoxGeometry(cL, cH, cW)),
+    new THREE.LineBasicMaterial({ color:0x8a8776 }));
+  contLine.position.set(cL/2, cH/2, 0);
+  scene.add(contLine);
+
+  const grid = new THREE.GridHelper(cL*1.15, 12, 0x22242a, 0x22242a);
+  grid.position.set(cL/2, 0, 0);
+  scene.add(grid);
+
+  let pieceCount = 0;
+  cont.items.forEach(it => {
+    const color = COLORS[it.category] ?? COLORS.other;
+    const box = makeShape(it, color);
+    box.position.set(it.x*SCALE, it.y*SCALE, it.z*SCALE);
+    scene.add(box);
+    clickable.push({ mesh: box, item: it });
+    pieceCount += it.qty;
+  });
+
+  if (idx === 0 && currentLayout.oversized && currentLayout.oversized.length) {
+    // Oversized items are shown as simple flat boxes OUTSIDE the container.
+    // Dimensions are capped to a visible, finite size regardless of how large
+    // the raw bounding-box from a diagonal/curved member might be.
+    const MAX_DISP = 3000; // max display dimension for oversized items in mm
+    currentLayout.oversized.forEach((it, i) => {
+      const dL = Math.min(Math.max(it.l, 1), cont.lengthMm);
+      const dH = Math.min(Math.max(it.h, 1), Math.min(it.h, MAX_DISP));
+      const dW = Math.min(Math.max(it.w, 1), Math.min(it.w, MAX_DISP));
+      const box = makeBox(dL, dH, dW, OVERSIZED_COLOR, 0.6);
+      box.position.set(
+        (dL/2)*SCALE,
+        (dH/2)*SCALE,
+        (cont.widthMm/2 + 500 + i*(Math.min(dW, 600) + 200))*SCALE
+      );
+      scene.add(box);
+      clickable.push({ mesh:box, item:{
+        mark:it.mark, assemblyName:it.assemblyName,
+        lengthMm:it.l, widthMm:it.w, heightMm:it.h,
+        unitWeightKg:it.weight, qty:1
+      }, oversized:true });
+      pieceCount += 1;
+    });
+  }
+
+  camera.position.set(cL*0.9, cH*1.6, cL*0.7);
+  controls.target.set(cL/2, cH*0.35, 0);
+  controls.update();
+
+  document.getElementById('contDims').textContent =
+    `${cont.lengthMm}x${cont.widthMm}x${cont.heightMm}mm`;
+  document.getElementById('pieceCount').textContent = pieceCount;
+  document.getElementById('weightUtil').textContent =
+    `${cont.usedWeightKg} kg / ${cont.maxWeightKg} kg (${cont.weightUtilizationPct}%)`;
+  document.getElementById('volUtil').textContent = `${cont.volumeUtilizationPct}%`;
+
+  // Shape breakdown - shows how many of each cross-section this container holds
+  const shapeCounts = {};
+  cont.items.forEach(it => {
+    const label = it.profileShape || '(unknown)';
+    shapeCounts[label] = (shapeCounts[label] || 0) + (it.qty || 1);
+  });
+  const shapeSumEl = document.getElementById('shapeSum');
+  if (shapeSumEl) {
+    const labels = { plate:'Plates', rod:'Rods', z_channel:'Z-purlins',
+                     c_channel:'C-channels', l_angle:'L-angles',
+                     i_beam:'I-beams', rhs:'Hollow tubes' };
+    const rows = Object.entries(shapeCounts)
+      .sort((a,b) => b[1]-a[1])
+      .map(([k,v]) => `<div style="display:flex;justify-content:space-between"><span>${labels[k]||k}</span><b>${v}</b></div>`)
+      .join('');
+    shapeSumEl.innerHTML = rows;
+  }
+
+  renderTabs();
+  document.getElementById('info').style.display = 'none';
+}
+
+function renderTabs() {
+  const tabsEl = document.getElementById('tabs');
+  tabsEl.innerHTML = '';
+  currentLayout.containers.forEach((c, i) => {
+    const btn = document.createElement('button');
+    btn.textContent = `Container ${c.containerNumber}`;
+    btn.className = i === currentContainerIdx ? 'active' : '';
+    btn.onclick = () => renderContainer(i);
+    tabsEl.appendChild(btn);
+  });
+}
+
+function findClickableRoot(obj) {
+  let cur = obj;
+  while (cur) {
+    const found = clickable.find(c => c.mesh === cur);
+    if (found) return found;
+    cur = cur.parent;
+  }
+  return null;
+}
+
+// ------------------------------------------------------------------
+// MANUAL PLACEMENT - select any placed piece, move it (100mm steps) or
+// rotate it (90 degree steps), with a live overlap/bounds check after
+// every action. Rotation is restricted to 90 degree increments
+// deliberately: it keeps the "does this collide" check exact (an
+// axis-aligned bounding box after a 90 degree turn is still an exact
+// axis-aligned box - no approximation), while still covering the real
+// case that matters, turning a piece to face a different way to make it
+// fit better.
+// ------------------------------------------------------------------
+let selected = null;
+const MOVE_STEP_MM = 100;
+
+// --- Drag-to-place state ---
+let isDragging = false;
+let dragMoved = false;
+let dragStartPosition = null;
+const dragPlane = new THREE.Plane();
+const dragIntersection = new THREE.Vector3();
+
+// --- Rotation preview widget state (independent mini scene in top-right) ---
+let previewScene = null, previewCamera = null, previewRenderer = null;
+let previewControls = null, previewMesh = null;
+let previewRotation = { x: 0, y: 0, z: 0 };
+let previewInitialized = false;
+
+function initRotPreview() {
+  if (previewInitialized) return;
+  const canvas = document.getElementById('rotPreviewCanvas');
+  previewScene = new THREE.Scene();
+  previewScene.background = new THREE.Color(0x0a0b0e);
+  previewCamera = new THREE.PerspectiveCamera(38, 320/220, 0.1, 500);
+  previewCamera.position.set(3, 2, 3);
+  previewRenderer = new THREE.WebGLRenderer({ canvas, antialias:true });
+  previewRenderer.setSize(320, 220);
+  previewControls = new THREE.OrbitControls(previewCamera, canvas);
+  previewControls.enableZoom = false;
+  previewControls.enablePan = false;
+
+  previewScene.add(new THREE.AmbientLight(0xffffff, 0.65));
+  const dir = new THREE.DirectionalLight(0xffffff, 0.85);
+  dir.position.set(5, 10, 7);
+  previewScene.add(dir);
+  const dir2 = new THREE.DirectionalLight(0xffffff, 0.35);
+  dir2.position.set(-5, -3, -7);
+  previewScene.add(dir2);
+
+  previewInitialized = true;
+  animatePreview();
+}
+
+function animatePreview() {
+  requestAnimationFrame(animatePreview);
+  if (previewRenderer && previewControls && previewMesh) {
+    previewControls.update();
+    previewRenderer.render(previewScene, previewCamera);
+  }
+}
+
+function showRotPreview(entry) {
+  initRotPreview();
+  const widget = document.getElementById('rotWidget');
+  widget.style.display = 'block';
+  document.getElementById('rotWidgetTitle').textContent =
+    entry.item.mark + ' - rotate & apply';
+
+  if (previewMesh) { previewScene.remove(previewMesh); previewMesh = null; }
+  const color = COLORS[entry.item.category] ?? COLORS.other;
+
+  // Wrap the shape in a group so we can add axes at the group's origin
+  // without them being rotated by the user's rotation actions.
+  const shapeMesh = makeShape(entry.item, color, 0.95);
+  previewMesh = new THREE.Group();
+  previewMesh.add(shapeMesh);
+  // Axes: red = X, green = Y, blue = Z. Sized to the piece so they're
+  // always visible next to it regardless of dimensions.
+  const box = new THREE.Box3().setFromObject(shapeMesh);
+  const size = new THREE.Vector3(); box.getSize(size);
+  const maxDim = Math.max(size.x, size.y, size.z) || 1;
+  const axesHelper = new THREE.AxesHelper(maxDim * 0.7);
+  previewMesh.add(axesHelper);
+  previewScene.add(previewMesh);
+  previewRotation = { x:0, y:0, z:0 };
+
+  // Frame the camera on the item so it fills the preview nicely
+  const d = maxDim * 1.9;
+  previewCamera.position.set(d, d*0.55, d);
+  previewControls.target.set(0, 0, 0);
+  previewControls.update();
+}
+
+function hideRotPreview() {
+  document.getElementById('rotWidget').style.display = 'none';
+  if (previewMesh && previewScene) previewScene.remove(previewMesh);
+  previewMesh = null;
+}
+
+function rotPreview(axis) {
+  if (!previewMesh) return;
+  // Rotate only the actual shape mesh (child 0) - the axes helper stays put
+  const shapeMesh = previewMesh.children[0];
+  if (!shapeMesh) return;
+  shapeMesh.rotation[axis] += Math.PI / 2;
+  previewRotation[axis] += Math.PI / 2;
+}
+
+function rotPreviewReset() {
+  if (!previewMesh) return;
+  const shapeMesh = previewMesh.children[0];
+  if (shapeMesh) shapeMesh.rotation.set(0, 0, 0);
+  previewRotation = { x:0, y:0, z:0 };
+}
+
+// Apply the preview's rotation to the actual selected piece, but only if it
+// doesn't cause the piece to leave the container or overlap another piece.
+function rotPreviewApply() {
+  if (!selected) return;
+  const m = selected.mesh;
+
+  // Apply the rotation directly - no popup, no rollback. If the new
+  // rotation causes overlap or push-outside, checkSelectedFit will turn
+  // the piece red so the user can see the collision and nudge it away
+  // with the arrow keys.
+  m.rotation.x += previewRotation.x;
+  m.rotation.y += previewRotation.y;
+  m.rotation.z += previewRotation.z;
+
+  previewRotation = { x:0, y:0, z:0 };
+  if (previewMesh && previewMesh.children[0]) previewMesh.children[0].rotation.set(0, 0, 0);
+
+  checkSelectedFit();
+  renderInfoPanel();
+}
+
+// Returns null if the selected piece's current position/rotation fits the
+// container with no overlap, or a short reason string if it doesn't.
+function evaluateFit() {
+  if (!selected || !currentLayout) return null;
+  selected.mesh.updateMatrixWorld(true);
+  const box = new THREE.Box3().setFromObject(selected.mesh);
+
+  const cont = currentLayout.containers[currentContainerIdx];
+  const containerBox = new THREE.Box3(
+    new THREE.Vector3(-0.5, -0.5, -cont.widthMm*SCALE/2 - 0.5),
+    new THREE.Vector3(cont.lengthMm*SCALE + 0.5, cont.heightMm*SCALE + 0.5, cont.widthMm*SCALE/2 + 0.5)
+  );
+  if (!containerBox.containsBox(box)) return 'push the piece outside the container';
+
+  for (const entry of clickable) {
+    if (entry === selected || entry.oversized) continue;
+    // If the selection is a sub-piece pulled out of a bundle, skip that
+    // bundle's own bounding box - the sub-piece IS still inside its
+    // parent bundle's group, so the world bbox would always "overlap"
+    // itself and every other piece in the same bundle.
+    if (selected.isSubPiece && entry === selected.parent) continue;
+    entry.mesh.updateMatrixWorld(true);
+    if (box.intersectsBox(new THREE.Box3().setFromObject(entry.mesh)))
+      return 'overlap ' + entry.item.mark;
+  }
+  return null;
+}
+
+function onMouseDown(e) {
+  mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
+  mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+  raycaster.setFromCamera(mouse, camera);
+  const hits = raycaster.intersectObjects(clickable.map(c => c.mesh), true);
+  if (hits.length === 0) return;
+  const found = findClickableRoot(hits[0].object);
+  if (!found) return;
+
+  selectItem(found);
+  isDragging = true;
+  dragMoved = false;
+  dragStartPosition = selected.mesh.position.clone();
+  dragPlane.set(new THREE.Vector3(0, 1, 0), -selected.mesh.position.y);
+  controls.enabled = false;
+  e.stopImmediatePropagation();
+}
+
+// Move the piece to the mouse position, but never allow it to leave the
+// container or overlap another piece. If the target position would violate
+// either, we hold the piece at its last valid position - the user has to
+// route around obstacles rather than push through them.
+function onMouseMove(e) {
+  if (!isDragging || !selected) return;
+  mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
+  mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+  raycaster.setFromCamera(mouse, camera);
+  if (!raycaster.ray.intersectPlane(dragPlane, dragIntersection)) return;
+
+  const oldX = selected.mesh.position.x;
+  const oldZ = selected.mesh.position.z;
+
+  selected.mesh.position.x = dragIntersection.x;
+  selected.mesh.position.z = dragIntersection.z;
+  selected.mesh.updateMatrixWorld(true);
+
+  // Clamp inside container bounds along X/Z
+  const cont = currentLayout.containers[currentContainerIdx];
+  const box = new THREE.Box3().setFromObject(selected.mesh);
+  const contMinX = 0, contMaxX = cont.lengthMm * SCALE;
+  const contMinZ = -cont.widthMm * SCALE / 2, contMaxZ = cont.widthMm * SCALE / 2;
+
+  if (box.min.x < contMinX) selected.mesh.position.x += (contMinX - box.min.x);
+  if (box.max.x > contMaxX) selected.mesh.position.x -= (box.max.x - contMaxX);
+  if (box.min.z < contMinZ) selected.mesh.position.z += (contMinZ - box.min.z);
+  if (box.max.z > contMaxZ) selected.mesh.position.z -= (box.max.z - contMaxZ);
+
+  selected.mesh.updateMatrixWorld(true);
+  const clampedBox = new THREE.Box3().setFromObject(selected.mesh);
+
+  // Overlap check - if it would collide with any other placed piece, revert
+  let collides = false;
+  for (const entry of clickable) {
+    if (entry === selected || entry.oversized) continue;
+    entry.mesh.updateMatrixWorld(true);
+    if (clampedBox.intersectsBox(new THREE.Box3().setFromObject(entry.mesh))) {
+      collides = true; break;
+    }
+  }
+  if (collides) {
+    selected.mesh.position.x = oldX;
+    selected.mesh.position.z = oldZ;
+    selected.mesh.updateMatrixWorld(true);
+  }
+
+  dragMoved = true;
+  checkSelectedFit();
+  renderInfoPanel();
+}
+
+function onMouseUp(e) {
+  if (!isDragging) return;
+  isDragging = false;
+  controls.enabled = true;
+}
+
+function onClick(e) {
+  if (dragMoved) { dragMoved = false; return; }
+  mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
+  mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+  raycaster.setFromCamera(mouse, camera);
+  const hits = raycaster.intersectObjects(clickable.map(c => c.mesh), true);
+  if (hits.length === 0) { deselectItem(); return; }
+  const bundleRoot = findClickableRoot(hits[0].object);
+  if (!bundleRoot) { deselectItem(); return; }
+
+  // Select the SPECIFIC sub-mesh that was hit, not the whole bundle
+  // group. This lets the user pick one C-channel out of a nested pair, or
+  // one Z-purlin out of a stack, and rotate/move only that piece. If the
+  // hit itself is the top-level clickable (a single I-beam, a plate stack)
+  // just select it as-is.
+  const hitMesh = hits[0].object;
+  const isBundlePiece = (hitMesh !== bundleRoot.mesh);
+  if (isBundlePiece) {
+    selectItem({
+      mesh: hitMesh,
+      item: { ...bundleRoot.item, qty: 1, stacked: false, nested: false,
+              bundled: false, beamBundle: false, gridCols: undefined,
+              gridRows: undefined },
+      isSubPiece: true,
+      parent: bundleRoot
+    });
+  } else {
+    selectItem(bundleRoot);
+  }
+}
+
+function selectItem(found) {
+  if (selected && selected !== found) tintMesh(selected.mesh, 0x000000);
+  selected = found;
+  checkSelectedFit();
+  renderInfoPanel();
+  showRotPreview(found);
+}
+
+function deselectItem() {
+  if (selected) tintMesh(selected.mesh, 0x000000);
+  selected = null;
+  document.getElementById('info').style.display = 'none';
+  hideRotPreview();
+}
+
+function tintMesh(mesh, hex) {
+  mesh.traverse(obj => {
+    if (obj.material && obj.material.emissive) obj.material.emissive.setHex(hex);
+  });
+}
+
+function rotateSelected(axis) {
+  if (!selected) return;
+  if (axis === 'x') selected.mesh.rotation.x += Math.PI / 2;
+  if (axis === 'y') selected.mesh.rotation.y += Math.PI / 2;
+  if (axis === 'z') selected.mesh.rotation.z += Math.PI / 2;
+  checkSelectedFit();
+  renderInfoPanel();
+}
+
+// Live fit check: after any move/rotate, look at the selected piece's
+// current world-space bounding box vs the container walls and every other
+// placed piece. A bright RED emissive tint marks a problem (out-of-bounds
+// or overlap), a bright ORANGE tint means the piece is in a valid spot.
+function checkSelectedFit() {
+  if (!selected || !currentLayout) return false;
+  selected.fitProblem = evaluateFit();
+  // Red = overlap/outside, Orange = fits.
+  tintMesh(selected.mesh, selected.fitProblem ? 0xff0000 : 0xff8800);
+  return !selected.fitProblem;
+}
+
+function renderInfoPanel() {
+  const infoEl = document.getElementById('info');
+  if (!selected) { infoEl.style.display = 'none'; return; }
+  const it = selected.item;
+  const problem = selected.fitProblem;
+
+  const shapeLabels = {
+    plate: 'Plate (flat sheet)',
+    rod: 'Round rod / bar',
+    z_channel: 'Z-purlin (Z profile)',
+    c_channel: 'C-channel (C profile)',
+    l_angle: 'L-angle',
+    i_beam: 'I-beam',
+    rhs: 'Rectangular hollow tube'
+  };
+  const shapeLabel = it.profileShape ? shapeLabels[it.profileShape] || it.profileShape : 'Auto (from name)';
+
+  infoEl.style.display = 'block';
+  infoEl.innerHTML = `
+    <b>${it.mark}</b> - ${it.assemblyName}<br>
+    <span style="color:#7fbef5">Shape: ${shapeLabel}</span><br>
+    Length: ${Math.round(it.lengthMm)} mm &middot; ${Math.round(it.widthMm)} x ${Math.round(it.heightMm)} mm section<br>
+    Unit weight: ${it.unitWeightKg} kg &middot; Qty: ${it.qty}
+    ${selected.oversized ? '<br><span style="color:#E24B4A">Exceeds container dimensions - needs flat rack / special handling</span>' : ''}
+    ${it.stacked ? `<br>Shown as one stacked bundle of ${it.qty}` : ''}
+    <br>${problem
+        ? `<span style="color:#E24B4A">Would ${problem}</span>`
+        : `<span style="color:#1D9E75">Fits - no overlap</span>`}
+    <div style="margin-top:8px;font-size:11px;color:#8a8776">Arrows: &larr;&rarr; = Y &middot; &uarr;&darr; = X &middot; PgUp/PgDn = Z (100mm)</div>
+    <div style="margin-top:8px">
+      <button onclick="deselectItem()">Done</button>
+    </div>
+  `;
+}
+
+// ------------------------------------------------------------------
+// MODE SWITCHING + LOADING
+// ------------------------------------------------------------------
+function setMode(mode) {
+  currentMode = mode;
+  document.getElementById('btnQuick').classList.toggle('active', mode === 'quick');
+  document.getElementById('btnOptimize').classList.toggle('active', mode === 'optimize');
+  currentLayout = mode === 'quick'
+    ? layoutQuick(rawScene.items, rawScene.containerSpec)
+    : layoutOptimized(rawScene.items, rawScene.containerSpec);
+  currentContainerIdx = 0;
+  renderContainer(0);
+}
+
+function loadScene(data) {
+  const { valid, issues } = validateRawItems(data.items || []);
+  rawScene = { ...data, items: valid };
+  dataIssues = issues;
+
+  document.getElementById('dropZone').classList.add('hidden');
+  document.getElementById('panel').style.display = 'block';
+  document.getElementById('hint').style.display = 'block';
+  document.getElementById('loadAnother').style.display = 'block';
+  document.getElementById('jobTitle').textContent =
+    `${data.jobNo} \u00b7 Bldg ${data.bldgNo} \u00b7 Phase ${data.phaseNo}`;
+
+  const legendEl = document.getElementById('legend');
+  legendEl.innerHTML = '';
+  Object.entries(COLORS).forEach(([cat,color]) => {
+    const hex = '#' + color.toString(16).padStart(6,'0');
+    const row = document.createElement('div');
+    row.innerHTML = `<span class="swatch" style="background:${hex}"></span><span>${cat}</span>`;
+    legendEl.appendChild(row);
+  });
+  const ovRow = document.createElement('div');
+  ovRow.innerHTML = `<span class="swatch" style="background:#E24B4A;opacity:0.5"></span><span>Oversized / doesn't fit</span>`;
+  legendEl.appendChild(ovRow);
+
+  renderDataIssues();
+  setMode('quick');
+}
+
+function renderDataIssues() {
+  const el = document.getElementById('dataIssues');
+  if (dataIssues.length === 0) { el.style.display = 'none'; el.innerHTML = ''; return; }
+
+  el.style.display = 'block';
+  const shown = dataIssues.slice(0, 15);
+  const rows = shown.map(i =>
+    `<div style="margin-bottom:6px"><b>${i.mark}</b> (${i.assemblyName}) - ${i.problems.join('; ')}</div>`
+  ).join('');
+  const more = dataIssues.length > shown.length
+    ? `<div style="color:#8a8776">+ ${dataIssues.length - shown.length} more</div>` : '';
+
+  el.innerHTML = `
+    <div style="color:#E24B4A;font-weight:600;margin-bottom:6px">
+      ${dataIssues.length} item(s) excluded - invalid dimensions/weight
+    </div>
+    ${rows}${more}
+  `;
+}
+
+// ------------------------------------------------------------------
+// DIRECT EXCEL PARSING (no C# step needed) - mirrors the same layout
+// ExcelReader.cs expects from an AEM Shipping List export:
+//   Row 6  : Job No (D6), Bldg No (F6), Phase No (H6), Customer (L6)
+//   Row 8  : column headers
+//   Row 10+: ASSM MARK(C) QTY(D) ASSEMBLY NAME(E) OVERALL SIZE(H)
+//            LENGTH(J) UNIT WT(K) TOT WT(L)
+// Default container is the standard 40ft box - edit DEFAULT_CONTAINER below
+// if your usual container/trailer is a different size.
+// ------------------------------------------------------------------
+const DEFAULT_CONTAINER = { lengthMm: 12000, widthMm: 2350, heightMm: 2690, maxWeightKg: 26000 };
+
+function categorizeName(name) {
+  const n = (name || '').toUpperCase();
+  if (n.includes('COLUMN') || n.includes('RAFTER') || n.includes('BEAM')) return 'beam';
+  if (n.includes('ROD') || n.includes('BRACE') || n.includes('PIPE')) return 'rod';
+  if (n.includes('PLT') || n.includes('PLATE') || n.includes('SHIM') || n.includes('SHEET')) return 'plate';
+  if (n.includes('PURLIN') || n.includes('CHANNEL') || n.includes('GIRT')) return 'purlin';
+  return 'other';
+}
+
+function parseOverallSize(sizeStr, fallbackLength) {
+  if (!sizeStr) return [fallbackLength || 0, 50, 50];
+  const parts = String(sizeStr).toUpperCase().split('X').map(s => s.trim()).filter(Boolean);
+  if (parts.length === 3) {
+    const [l, w, h] = parts.map(Number);
+    if (!isNaN(l) && !isNaN(w) && !isNaN(h)) return [l, w, h];
+  }
+  return [fallbackLength || 0, 50, 50];
+}
+
+function cell(rows, r, c) {
+  return rows[r] ? rows[r][c] : undefined;
+}
+
+function parseShippingListExcel(arrayBuffer) {
+  const wb = XLSX.read(arrayBuffer, { type: 'array' });
+  const ws = wb.Sheets[wb.SheetNames[0]];
+  const rows = XLSX.utils.sheet_to_json(ws, { header: 1, raw: true, defval: null });
+
+  const jobNo = cell(rows, 5, 3) ?? '';
+  const bldgNo = cell(rows, 5, 5) ?? '';
+  const phaseNo = cell(rows, 5, 7) ?? '';
+  const customer = cell(rows, 5, 11) ?? '';
+
+  const items = [];
+  let r = 9; // row 10 (0-indexed)
+  let blank = 0;
+  while (blank < 3 && r < rows.length + 3) {
+    const mark = cell(rows, r, 2);
+    if (mark === null || mark === undefined || String(mark).trim() === '') {
+      blank++; r++; continue;
+    }
+    blank = 0;
+    const qty = Number(cell(rows, r, 3)) || 0;
+    const name = String(cell(rows, r, 4) ?? '').trim();
+    const size = String(cell(rows, r, 7) ?? '').trim();
+    const length = Number(cell(rows, r, 9)) || 0;
+    const unitWt = Number(cell(rows, r, 10)) || 0;
+    const [l, w, h] = parseOverallSize(size, length);
+
+    items.push({
+      mark: String(mark).trim(), assemblyName: name, category: categorizeName(name),
+      lengthMm: l, widthMm: w, heightMm: h, qty, unitWeightKg: Math.round(unitWt * 1000) / 1000
+    });
+    r++;
+  }
+
+  return {
+    jobNo: String(jobNo), bldgNo: String(bldgNo), phaseNo: String(phaseNo), customer: String(customer),
+    containerSpec: { ...DEFAULT_CONTAINER },
+    items
+  };
+}
+
+function handleFile(file) {
+  const isExcel = /\.xlsx?$/i.test(file.name);
+  const reader = new FileReader();
+
+  reader.onload = (e) => {
+    try {
+      if (isExcel) {
+        loadScene(parseShippingListExcel(e.target.result));
+      } else {
+        loadScene(JSON.parse(e.target.result));
+      }
+    } catch (err) {
+      alert('Could not read this file: ' + err.message);
+    }
+  };
+
+  if (isExcel) reader.readAsArrayBuffer(file);
+  else reader.readAsText(file);
+}
+
+document.getElementById('fileInput').addEventListener('change', e => { if (e.target.files[0]) handleFile(e.target.files[0]); });
+document.getElementById('fileInput2').addEventListener('change', e => { if (e.target.files[0]) handleFile(e.target.files[0]); });
+document.getElementById('btnQuick').addEventListener('click', () => setMode('quick'));
+document.getElementById('btnOptimize').addEventListener('click', () => setMode('optimize'));
+
+// ------------------------------------------------------------------
+// Bridge for a native host (e.g. the SteelViewerApp WinForms app) to push
+// data straight in, without going through the file picker at all.
+// ------------------------------------------------------------------
+window.loadSceneFromDotNet = function (jsonStr) {
+  try {
+    const data = JSON.parse(jsonStr);
+    document.getElementById('dropZone').classList.add('hidden');
+    loadScene(data);
+  } catch (e) {
+    alert('Error loading data from the app: ' + e.message);
+  }
+};
+
+initThree();
+</script>
+</body>
+</html>

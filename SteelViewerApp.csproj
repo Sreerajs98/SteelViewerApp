@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>SteelViewerApp</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- If either exact version is not found by NuGet, remove the Version
+         attribute so it pulls the latest available release. -->
+    <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.2478.35" />
+    <PackageReference Include="ClosedXML" Version="0.104.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Update="Viewer3D.html">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Update="SampleData\A1442-01-101-R0_Shipping_List.xlsx">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
+</Project>
