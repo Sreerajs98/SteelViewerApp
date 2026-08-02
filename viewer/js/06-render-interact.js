@@ -240,65 +240,65 @@ function renderContainer(idx) {
       };
     }
 
-      // Welded assemblies (rafters, etc.): makeShape needs IFC parts + original
-      // geometry dims — not packFootprintW/H (those are packing AABBs → box look).
-      {
-          const isAsm = it.groupKind === 'welded_assembly'
-              || !!it.isAssembly
-              || !!(it.parts && it.parts.length > 1);
-          if (isAsm) {
-              let parts = it.parts;
-              if ((!parts || !parts.length) && Array.isArray(it.memberItems)) {
-                  const mem = it.memberItems.find(m => m && m.parts && m.parts.length);
-                  if (mem) parts = mem.parts;
-              }
-              if ((!parts || !parts.length)
-                  && typeof rawScene !== 'undefined' && rawScene && rawScene.items) {
-                  try {
-                      const marks = new Set(
-                          [it.mark, ...((it.marks) || [])].filter(Boolean).map(String));
-                      const src = rawScene.items.find(r =>
-                          r && r.parts && r.parts.length
-                          && (marks.has(String(r.mark || ''))
-                              || ((r.marks) || []).some(m => marks.has(String(m)))));
-                      if (src) {
-                          parts = src.parts;
-                          if (it._origLengthMm == null && +src.lengthMm > 0)
-                              it._origLengthMm = +src.lengthMm;
-                          if (it._origWidthMm == null
-                              && (+src.widthMm > 0 || +src.unitWidth > 0 || +src.sectW > 0))
-                              it._origWidthMm = +src.widthMm || +src.unitWidth || +src.sectW;
-                          if (it._origHeightMm == null
-                              && (+src.heightMm > 0 || +src.unitHeight > 0 || +src.sectH > 0))
-                              it._origHeightMm = +src.heightMm || +src.unitHeight || +src.sectH;
-                          if (!it.pathPointsMm && src.pathPointsMm)
-                              it.pathPointsMm = src.pathPointsMm;
-                      }
-                  } catch (_) { /* */ }
-              }
-              if (parts && parts.length) {
-                  shapeIt = {
-                      ...it,
-                      ...shapeIt,
-                      lengthMm: it._origLengthMm || it.shippingLengthMm || it.lengthMm,
-                      widthMm: it._origWidthMm || it.shippingWidthMm || it.flangeWidthMm
-                          || it.sectW || it.unitWidth || it.widthMm,
-                      heightMm: it._origHeightMm || it.shippingHeightMm || it.sectH
-                          || it.unitHeight || it.heightMm,
-                      unitHeight: it.sectH || it.unitHeight || it._origHeightMm || it.heightMm,
-                      unitWidth: it.sectW || it.unitWidth || it._origWidthMm || it.widthMm,
-                      parts,
-                      pathPointsMm: it.pathPointsMm || shapeIt.pathPointsMm || null,
-                      isAssembly: true,
-                      // Keep pack pose; skip remorph so IFC mesh stays Group-By shape
-                      _keepGroupByBundle: false,
-                      _skipStability: true,
-                      _freezeGroupByPose: true,
-                      assemblyShipPose: true,
-                  };
-              }
-          }
+    // Welded assemblies (rafters, etc.): makeShape needs IFC parts + original
+    // geometry dims — not packFootprintW/H (those are packing AABBs → box look).
+    {
+      const isAsm = it.groupKind === 'welded_assembly'
+        || !!it.isAssembly
+        || !!(it.parts && it.parts.length > 1);
+      if (isAsm) {
+        let parts = it.parts;
+        if ((!parts || !parts.length) && Array.isArray(it.memberItems)) {
+          const mem = it.memberItems.find(m => m && m.parts && m.parts.length);
+          if (mem) parts = mem.parts;
+        }
+        if ((!parts || !parts.length)
+            && typeof rawScene !== 'undefined' && rawScene && rawScene.items) {
+          try {
+            const marks = new Set(
+              [it.mark, ...((it.marks) || [])].filter(Boolean).map(String));
+            const src = rawScene.items.find(r =>
+              r && r.parts && r.parts.length
+              && (marks.has(String(r.mark || ''))
+                || ((r.marks) || []).some(m => marks.has(String(m)))));
+            if (src) {
+              parts = src.parts;
+              if (it._origLengthMm == null && +src.lengthMm > 0)
+                it._origLengthMm = +src.lengthMm;
+              if (it._origWidthMm == null
+                  && (+src.widthMm > 0 || +src.unitWidth > 0 || +src.sectW > 0))
+                it._origWidthMm = +src.widthMm || +src.unitWidth || +src.sectW;
+              if (it._origHeightMm == null
+                  && (+src.heightMm > 0 || +src.unitHeight > 0 || +src.sectH > 0))
+                it._origHeightMm = +src.heightMm || +src.unitHeight || +src.sectH;
+              if (!it.pathPointsMm && src.pathPointsMm)
+                it.pathPointsMm = src.pathPointsMm;
+            }
+          } catch (_) { /* */ }
+        }
+        if (parts && parts.length) {
+          shapeIt = {
+            ...it,
+            ...shapeIt,
+            lengthMm: it._origLengthMm || it.shippingLengthMm || it.lengthMm,
+            widthMm: it._origWidthMm || it.shippingWidthMm || it.flangeWidthMm
+              || it.sectW || it.unitWidth || it.widthMm,
+            heightMm: it._origHeightMm || it.shippingHeightMm || it.sectH
+              || it.unitHeight || it.heightMm,
+            unitHeight: it.sectH || it.unitHeight || it._origHeightMm || it.heightMm,
+            unitWidth: it.sectW || it.unitWidth || it._origWidthMm || it.widthMm,
+            parts,
+            pathPointsMm: it.pathPointsMm || shapeIt.pathPointsMm || null,
+            isAssembly: true,
+            // Keep pack pose; skip remorph so IFC mesh stays Group-By shape
+            _keepGroupByBundle: false,
+            _skipStability: true,
+            _freezeGroupByPose: true,
+            assemblyShipPose: true,
+          };
+        }
       }
+    }
 
     // Twin rafters: real IFC mesh, forced upright to pack footprint (L×H×W).
     // Proxy box only if align cannot reach steel W×H (pitched IFC leftover).
@@ -441,6 +441,47 @@ function renderContainer(idx) {
     currentLayout.oversized.forEach((it, i) => {
       const yardView = !!(currentLayout?.isGroupedView || currentLayout?.isOutsideView
         || it._yardStraighten || it.outsideContainer);
+
+      // ── STEP 0: Look up Group By orientation + nest data from assemblyGroups ──
+      // Outside/leftover items must render in the same pose as Group By view.
+      // Without this, nest bundles show as IFC-world fan spread (each piece pitched).
+      if (typeof assemblyGroups !== 'undefined' && assemblyGroups) {
+        const marks = new Set(
+          [it.mark, ...((it.marks) || [])].filter(Boolean).map(String)
+        );
+        const srcGroup = assemblyGroups.find(g => {
+          if (!g) return false;
+          const gm = g.marks && g.marks.length ? g.marks : [g.mark];
+          return (gm || []).some(m => marks.has(String(m || '')));
+        });
+        if (srcGroup) {
+          // Carry Group By orientation quaternion
+          if (!it._groupByQuat && srcGroup._groupByQuat) {
+            it._groupByQuat = { ...srcGroup._groupByQuat };
+            it._freezeGroupByPose = true;
+          }
+          // Carry nest geometry data from pack unit
+          const pu = srcGroup.packUnits && srcGroup.packUnits[0];
+          if (pu) {
+            if (!it.nestPieces && pu.nestPieces && pu.nestPieces.length)
+              it.nestPieces = pu.nestPieces;
+            if (!it.stableBundleMm && pu.stableBundleMm)
+              it.stableBundleMm = pu.stableBundleMm;
+            if (!it.nestingInfo && pu.nestingInfo)
+              it.nestingInfo = pu.nestingInfo;
+            if (!it.nestMethod && pu.nestMethod)
+              it.nestMethod = pu.nestMethod;
+            if (!it.nestingOffsetMm && pu.nestingOffsetMm)
+              it.nestingOffsetMm = pu.nestingOffsetMm;
+            if (!it.orientation_info && pu.orientation_info)
+              it.orientation_info = pu.orientation_info;
+            if (!it.sectW && pu.sectW) it.sectW = pu.sectW;
+            if (!it.sectH && pu.sectH) it.sectH = pu.sectH;
+            if (!it.sectT && pu.sectT) it.sectT = pu.sectT;
+          }
+        }
+      }
+
       const itemForRender = {
         ...it,
         lengthMm: it.lengthMm || it.l || 500,
@@ -460,6 +501,17 @@ function renderContainer(idx) {
         parts: it.parts,
         pathPointsMm: it.pathPointsMm || null,
         pathDiamMm: it.pathDiamMm || 0,
+        // Carry nest data looked up above
+        nestPieces: it.nestPieces || null,
+        nestingInfo: it.nestingInfo || null,
+        nestMethod: it.nestMethod || null,
+        nestingOffsetMm: it.nestingOffsetMm || null,
+        orientation_info: it.orientation_info || null,
+        stableBundleMm: it.stableBundleMm || null,
+        _groupByQuat: it._groupByQuat || null,
+        _freezeGroupByPose: !!it._freezeGroupByPose,
+        _keepGroupByBundle: !!(it.nestPieces && it.nestPieces.length)
+          || /^nest_/i.test(String(it.groupKind || '')),
         // Yard: makeShape → groundOrient uses ortho straighten (no pitch lean)
         _yardStraighten: yardView || !!it._yardStraighten,
         assemblyShipPose: !!it.assemblyShipPose || !!it.isAssembly,
@@ -469,6 +521,12 @@ function renderContainer(idx) {
         ? 0xcc2222
         : (COLORS[it.category] ?? COLORS.other);
       const mesh = makeShape(itemForRender, color, 0.93);
+
+      // ── STEP 1: Apply Group By frozen orientation BEFORE ship prep ──
+      // This ensures nest bundles show flat (Group By pose), not IFC world fan.
+      if (it._groupByQuat && typeof applyGroupByFrozenQuat === 'function') {
+        applyGroupByFrozenQuat(mesh, it);
+      }
 
       // Use pre-computed position if available (from layoutOutside/layoutPlaceSelected)
       if (it.x !== undefined) {
@@ -494,8 +552,21 @@ function renderContainer(idx) {
         if (itemForRender._shipPrepped) it._shipPrepped = true;
         if (itemForRender._freezeGroupByPose) it._freezeGroupByPose = true;
         it.needs_ship_prep = !(prep && prep.ok);
-        if (typeof stampGroupByQuatOnStaging === 'function')
+        // ── STEP 2: Only stamp quat for non-nest items ──
+        // For nests: _groupByQuat already correct (from assemblyGroups lookup above).
+        // Stamping after csShipPrepMesh for nests would overwrite with IFC pose.
+        const isNestItem = /^nest_/i.test(String(it.groupKind || ''))
+          || it.shapeKey === 'z_channel'
+          || it.shapeKey === 'c_channel'
+          || it.shapeKey === 'l_angle';
+        if (!isNestItem && typeof stampGroupByQuatOnStaging === 'function') {
           stampGroupByQuatOnStaging(it, mesh);
+        } else if (isNestItem && it._groupByQuat
+            && typeof applyGroupByFrozenQuat === 'function') {
+          // Re-apply correct quat (ship prep may have moved mesh but not changed rot)
+          applyGroupByFrozenQuat(mesh, it);
+          if (typeof nailMeshToGroundY === 'function') nailMeshToGroundY(mesh, 0);
+        }
       } else if (typeof nailMeshToGroundY === 'function') {
         nailMeshToGroundY(mesh, 0);
       }
