@@ -336,13 +336,15 @@ function renderContainer(idx) {
           box.rotation.setFromQuaternion(box.quaternion);
           box.updateMatrixWorld(true);
         }
-        // The packer may seat a piece cross-wise, and that choice shows up only
-        // as a swapped L/W in the reserved footprint. Turn the mesh to match,
-        // otherwise it is drawn lying down the container while its slot runs
-        // across it, and it overhangs the side wall.
+        // Cross-wise L/W auto-yaw — forbidden for deterministic 2.5D assemblies
+        // (axis must stay 0/180). Nests / unlocked items may still correct.
+        const freezeAxis = !!(it._pack25dFreezePose || it._pack25dPoseLocked
+          || /deterministic_25d/i.test(String(
+            (typeof currentLayout !== 'undefined' && currentLayout
+              && currentLayout.packStrategy) || '')));
         const fl = +it.packFootprintL || 0;
         const fw = +it.packFootprintW || 0;
-        if (fl > 0 && fw > 0) {
+        if (!freezeAxis && fl > 0 && fw > 0) {
           const sc = (typeof SCALE === 'number' && SCALE > 0) ? SCALE : 0.01;
           box.updateMatrixWorld(true);
           const fb = new THREE.Box3().setFromObject(box);
@@ -403,8 +405,9 @@ function renderContainer(idx) {
 
   // Yard settle vs Pack V2 authority
   const inside = clickable.filter(c => !c.outsideContainer);
+  const strat = String((currentLayout && currentLayout.packStrategy) || '');
   const isPackV2Layout = !!(currentLayout
-    && (currentLayout.packStrategy === 'pack_v2_twins_stacks'
+    && (/pack_v2|binpack|deterministic_25d|twins|human_order/i.test(strat)
       || (cont.items || []).some(it => it && it._packV2Applied)));
 
   if (isPackV2Layout && inside.length) {
@@ -459,10 +462,23 @@ function renderContainer(idx) {
           return (gm || []).some(m => marks.has(String(m || '')));
         });
         if (srcGroup) {
-          // Carry Group By orientation quaternion
-          if (!it._groupByQuat && srcGroup._groupByQuat) {
+          const gkSrc = String(srcGroup.groupKind || '').toLowerCase();
+          const isAsmSrc = gkSrc === 'welded_assembly' || gkSrc === 'assembly_single'
+            || !!srcGroup.isAssembly;
+          // Nests keep Group By quat. Assemblies must NOT — yard/building pitch
+          // on leftovers is what looked like "Optimise still pitched" next to
+          // the container.
+          if (!isAsmSrc && !it._groupByQuat && srcGroup._groupByQuat) {
             it._groupByQuat = { ...srcGroup._groupByQuat };
             it._freezeGroupByPose = true;
+          }
+          if (isAsmSrc) {
+            try {
+              delete it._groupByQuat;
+              it._freezeGroupByPose = false;
+              it.isAssembly = true;
+              it.groupKind = it.groupKind || srcGroup.groupKind;
+            } catch (_) { /* */ }
           }
           // Carry nest geometry data from pack unit
           const pu = srcGroup.packUnits && srcGroup.packUnits[0];
@@ -482,10 +498,22 @@ function renderContainer(idx) {
             if (!it.sectW && pu.sectW) it.sectW = pu.sectW;
             if (!it.sectH && pu.sectH) it.sectH = pu.sectH;
             if (!it.sectT && pu.sectT) it.sectT = pu.sectT;
+            if (isAsmSrc && pu._shipPrepDimsMm && !it._shipPrepDimsMm)
+              it._shipPrepDimsMm = { ...pu._shipPrepDimsMm };
+            // Prefer the pack-unit's already-flat ship-prep quat (tip ≤ 80).
+            if (isAsmSrc && pu._groupByQuat && +(pu.tipGapMm) <= 80) {
+              it._groupByQuat = { ...pu._groupByQuat };
+              it._freezeGroupByPose = true;
+              it._shipPrepped = true;
+              it.tipGapMm = pu.tipGapMm;
+            }
           }
         }
       }
 
+      const gkIt = String(it.groupKind || '').toLowerCase();
+      const isAsmOut = !!it.isAssembly || gkIt === 'welded_assembly'
+        || gkIt === 'assembly_single' || !!(it.parts && it.parts.length >= 2);
       const itemForRender = {
         ...it,
         lengthMm: it.lengthMm || it.l || 500,
@@ -501,7 +529,7 @@ function renderContainer(idx) {
         beamBundle: it.beamBundle, unitDiam: it.unitDiam,
         unitThickness: it.unitThickness, qty: it.qty || 1,
         category: it.category,
-        isAssembly: it.isAssembly,
+        isAssembly: it.isAssembly || isAsmOut,
         parts: it.parts,
         pathPointsMm: it.pathPointsMm || null,
         pathDiamMm: it.pathDiamMm || 0,
@@ -518,16 +546,29 @@ function renderContainer(idx) {
           || /^nest_/i.test(String(it.groupKind || '')),
         // Yard: makeShape → groundOrient uses ortho straighten (no pitch lean)
         _yardStraighten: yardView || !!it._yardStraighten,
-        assemblyShipPose: !!it.assemblyShipPose || !!it.isAssembly,
+        assemblyShipPose: !!it.assemblyShipPose || isAsmOut,
+        _useShipPrepPose: isAsmOut && !(it._groupByQuat && +(it.tipGapMm) <= 80),
+        _shipPrepped: !!it._shipPrepped,
       };
       // needs_ship_prep → red tint (honest yard QA); else category color
       const color = (it.needs_ship_prep && !it._shipPrepped)
         ? 0xcc2222
         : (COLORS[it.category] ?? COLORS.other);
-      const mesh = makeShape(itemForRender, color, 0.93);
+      // Leftover assemblies: rebuild through ship prep unless pack unit already
+      // stamped a flat quat (tip ≤ 80) — replaying that is much cheaper.
+      let mesh = null;
+      if (isAsmOut && itemForRender._useShipPrepPose
+          && typeof csShipPrepPosedMesh === 'function') {
+        try {
+          delete itemForRender._groupByQuat;
+          itemForRender._freezeGroupByPose = false;
+          itemForRender._shipPrepped = false;
+          mesh = csShipPrepPosedMesh(itemForRender, color, 0.93);
+        } catch (_) { mesh = null; }
+      }
+      if (!mesh) mesh = makeShape(itemForRender, color, 0.93);
 
-      // ── STEP 1: Apply Group By frozen orientation BEFORE ship prep ──
-      // This ensures nest bundles show flat (Group By pose), not IFC world fan.
+      // ── STEP 1: Apply frozen orientation (flat ship-prep quat for asms) ──
       if (it._groupByQuat && typeof applyGroupByFrozenQuat === 'function') {
         applyGroupByFrozenQuat(mesh, it);
       }
@@ -546,9 +587,17 @@ function renderContainer(idx) {
           (cont.widthMm/2 + 500 + i*(Math.min(dW, 600) + 200))*SCALE
         );
       }
-      applyPackItemRotation(mesh, it);
+      if (!isAsmOut) applyPackItemRotation(mesh, it);
       // Ship Prep: load-ready pose (class router). Z keeps nest; assemblies tip+flat.
-      if (yardView && !it.exactPoseLock && !it.restoredFromOptimise
+      // Assemblies already posed via csShipPrepPosedMesh — only nail to ground.
+      if (isAsmOut) {
+        if (itemForRender.stableBundleMm) it.stableBundleMm = itemForRender.stableBundleMm;
+        if (itemForRender._groupByQuat) it._groupByQuat = itemForRender._groupByQuat;
+        it._shipPrepped = true;
+        it._shipPosedRender = true;
+        it.needs_ship_prep = false;
+        if (typeof nailMeshToGroundY === 'function') nailMeshToGroundY(mesh, 0);
+      } else if (yardView && !it.exactPoseLock && !it.restoredFromOptimise
           && typeof csShipPrepMesh === 'function') {
         const prep = csShipPrepMesh(mesh, itemForRender);
         if (itemForRender.stableBundleMm) it.stableBundleMm = itemForRender.stableBundleMm;
@@ -640,6 +689,23 @@ function renderContainer(idx) {
     }
     // FINAL MOVE pass after deconflict — assemblies must touch ground again
     outsFree.forEach(snapOut);
+    // Never leave leftovers floating: force every outside mesh minY → 0.
+    outsAll.forEach(c => {
+      if (!c || !c.mesh) return;
+      try {
+        if (typeof nailMeshToGroundY === 'function') nailMeshToGroundY(c.mesh, 0);
+        else if (typeof csNzSnapObjectToGround === 'function') csNzSnapObjectToGround(c.mesh);
+        else {
+          c.mesh.updateMatrixWorld(true);
+          const box = new THREE.Box3().setFromObject(c.mesh);
+          if (isFinite(box.min.y)) c.mesh.position.y -= box.min.y;
+        }
+        if (c.item) {
+          c.item.y = c.mesh.position.y / ((typeof SCALE === 'number' && SCALE > 0) ? SCALE : 0.01);
+          c.item._packV2FootYMm = 0;
+        }
+      } catch (_) { /* */ }
+    });
   }
 
   // Zoom out enough to see full 40ft box + outside staging lane
@@ -3840,10 +3906,17 @@ function runOptimizeKeepingLeftovers() {
         if (!c || !c.mesh || !c.item) return;
         const gk = String(c.item.groupKind || '').toLowerCase();
         if (gk === 'welded_assembly' || gk === 'assembly_single' || c.item.isAssembly) {
+          // Deterministic 2.5D: keep locked ship-prep quat — never re-tip
           try {
-            delete c.item._groupByQuat;
-            c.item._freezeGroupByPose = false;
-            c.item._shipPrepped = false;
+            if (c.item._pack25dPoseLocked && c.item._groupByQuat) {
+              c.item._pack25dFreezePose = true;
+              c.item._freezeGroupByPose = true;
+            } else {
+              delete c.item._groupByQuat;
+              c.item._freezeGroupByPose = false;
+              c.item._shipPrepped = false;
+              c.item._shipFloorContact = null;
+            }
           } catch (_) { /* */ }
           return;
         }
@@ -3852,11 +3925,39 @@ function runOptimizeKeepingLeftovers() {
     }
   } catch (_) { /* */ }
 
+  // Assemblies: drop cached yard ship-prep so Optimise rebuilds a solid-base
+  // flat pose (web/flange down, not sitting on cleats).
+  try {
+    groups.forEach(g => {
+      if (!g) return;
+      const gk = String(g.groupKind || '').toLowerCase();
+      const isAsm = gk === 'welded_assembly' || gk === 'assembly_single';
+      (g.packUnits || []).forEach(pu => {
+        if (!pu) return;
+        const pugk = String(pu.groupKind || gk).toLowerCase();
+        if (!(isAsm || pugk === 'welded_assembly' || pugk === 'assembly_single' || pu.isAssembly))
+          return;
+        try {
+          if (pu._pack25dPoseLocked && pu._groupByQuat) {
+            pu._pack25dFreezePose = true;
+            pu._freezeGroupByPose = true;
+          } else {
+            delete pu._groupByQuat;
+            pu._freezeGroupByPose = false;
+            pu._shipPrepped = false;
+            pu._shipFloorContact = null;
+          }
+        } catch (_) { /* */ }
+      });
+    });
+  } catch (_) { /* */ }
+
   const result = csPackV2RunOptimise({
     groups,
     containerSpec: rawScene.containerSpec,
     enableStacks: true,
     checkedOnly: true,
+    packStrategy: 'deterministic_25d',
   });
 
   if (!result || !result.layout) {

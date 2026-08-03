@@ -189,7 +189,19 @@ function parseShippingListExcel(arrayBuffer) {
 }
 
 function handleFile(file) {
+  if (!file) return;
+  if (/\.ifc$/i.test(file.name)) {
+    alert('IFC cannot be parsed in the browser.\n\n'
+      + '• Use the WinForms app → Upload IFC…\n'
+      + '• Or load a scene .json / shipping-list .xlsx here on localhost.');
+    return;
+  }
   const isExcel = /\.xlsx?$/i.test(file.name);
+  const isJson = /\.json$/i.test(file.name);
+  if (!isExcel && !isJson) {
+    alert('Please choose a .json scene or .xlsx shipping list.');
+    return;
+  }
   const reader = new FileReader();
 
   reader.onload = (e) => {
@@ -199,6 +211,10 @@ function handleFile(file) {
       } else {
         loadScene(JSON.parse(e.target.result));
       }
+      try {
+        const sm = document.getElementById('statusMsg');
+        if (sm) sm.textContent = 'Loaded ' + file.name;
+      } catch (_) { /* */ }
     } catch (err) {
       alert('Could not read this file: ' + err.message);
     }
@@ -207,9 +223,15 @@ function handleFile(file) {
   if (isExcel) reader.readAsArrayBuffer(file);
   else reader.readAsText(file);
 }
+// Expose for staging-bar inline onchange
+window.handleFile = handleFile;
 
-document.getElementById('fileInput').addEventListener('change', e => { if (e.target.files[0]) handleFile(e.target.files[0]); });
-document.getElementById('fileInput2').addEventListener('change', e => { if (e.target.files[0]) handleFile(e.target.files[0]); });
+['fileInput', 'fileInput2', 'fileInputStaging'].forEach(id => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener('change', e => {
+    if (e.target.files && e.target.files[0]) handleFile(e.target.files[0]);
+  });
+});
 document.getElementById('btnQuick').addEventListener('click', () => setMode('quick'));
 document.getElementById('btnOptimize').addEventListener('click', () => setMode('optimize'));
 
@@ -386,35 +408,8 @@ window.loadSceneFromUrl = async function (url) {
   }
 };
 
-// File input handlers
-document.getElementById('fileInput').addEventListener('change', function() {
-  if (!this.files[0]) return;
-  handleFileUpload(this.files[0]);
-});
-document.getElementById('fileInput2').addEventListener('change', function() {
-  if (!this.files[0]) return;
-  handleFileUpload(this.files[0]);
-});
-
-function handleFileUpload(file) {
-  const ext = file.name.split('.').pop().toLowerCase();
-  if (ext === 'json') {
-    const fr = new FileReader();
-    fr.onload = e => { try { loadScene(JSON.parse(e.target.result)); } catch(err) { alert('Invalid JSON: ' + err.message); } };
-    fr.readAsText(file);
-  } else if (ext === 'xlsx') {
-    const fr = new FileReader();
-    fr.onload = e => {
-      try {
-        const wb = XLSX.read(new Uint8Array(e.target.result), { type:'array' });
-        const ws = wb.Sheets[wb.SheetNames[0]];
-        const rows = XLSX.utils.sheet_to_json(ws, { header:1 });
-        document.getElementById('statusMsg').textContent = 'Excel loaded (' + rows.length + ' rows). Use C# app for full processing.';
-      } catch(err) { alert('Excel error: ' + err.message); }
-    };
-    fr.readAsArrayBuffer(file);
-  }
-}
+// Legacy alias — full parse lives in handleFile above
+function handleFileUpload(file) { handleFile(file); }
 
 // Initialise Three.js
 initThree();

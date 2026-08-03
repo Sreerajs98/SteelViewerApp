@@ -74,7 +74,14 @@ html, body { width:100%; height:100%; background:var(--bg); color:var(--text); f
 .tbtn.primary:hover { background:#2563eb; }
 .tbtn.success { background:var(--green); border-color:var(--green); color:#fff; }
 #topSep { flex:1; }
-#statusMsg { font-size:11.5px; color:var(--text3); white-space:nowrap; }
+#statusMsg { font-size:11.5px; color:var(--text3); white-space:nowrap; max-width:280px; overflow:hidden; text-overflow:ellipsis; }
+#btnUploadTop {
+  flex:none;
+  font-weight:700;
+  font-size:13px;
+  padding:8px 16px;
+  box-shadow:0 0 0 1px rgba(59,130,246,.35);
+}
 
 /* ═══════════════════════════════════════════════════════════════
    3-PANEL LAYOUT

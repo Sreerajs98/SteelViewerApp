@@ -253,6 +253,124 @@ function csShipPrepTipLevel(mesh, keepX, keepZ) {
  * @returns {boolean} true when the mesh was turned
  */
 /**
+ * How solidly the mesh sits on the floor (0..1).
+ *
+ * Cleat / tab legs only touch a few bottom bins, so the score stays low. A
+ * flange or web face fills most bins near minY — that is the base a human
+ * would put down first.
+ */
+function csShipPrepFloorContactFrac(mesh) {
+  if (!mesh || typeof THREE === 'undefined') return 0;
+  mesh.updateMatrixWorld(true);
+  const box = new THREE.Box3().setFromObject(mesh);
+  if (!isFinite(box.min.x)) return 0;
+  const sc = (typeof SCALE === 'number' && SCALE > 0) ? SCALE : 0.01;
+  const tol = 12 * sc; // 12 mm band above the floor
+  const nX = 10, nZ = 8;
+  const hit = new Array(nX * nZ).fill(false);
+  const v = new THREE.Vector3();
+  const x0 = box.min.x, z0 = box.min.z;
+  const sx = Math.max(box.max.x - box.min.x, 1e-9);
+  const sz = Math.max(box.max.z - box.min.z, 1e-9);
+  const yFloor = box.min.y;
+  let n = 0;
+  mesh.traverse(o => {
+    if (!o.isMesh || !o.geometry) return;
+    if (o.isLine || o.isLineSegments) return;
+    const pos = o.geometry.attributes && o.geometry.attributes.position;
+    if (!pos || pos.count < 3) return;
+    const step = Math.max(1, Math.floor(pos.count / 100));
+    for (let i = 0; i < pos.count && n < 4000; i += step) {
+      v.fromBufferAttribute(pos, i).applyMatrix4(o.matrixWorld);
+      if (v.y > yFloor + tol) continue;
+      const ix = Math.min(nX - 1, Math.max(0, Math.floor(((v.x - x0) / sx) * nX)));
+      const iz = Math.min(nZ - 1, Math.max(0, Math.floor(((v.z - z0) / sz) * nZ)));
+      hit[iz * nX + ix] = true;
+      n++;
+    }
+  });
+  let c = 0;
+  for (let i = 0; i < hit.length; i++) if (hit[i]) c++;
+  return c / hit.length;
+}
+
+/**
+ * Roll the piece onto its solid face: length stays horizontal, cleats / tabs
+ * must not be the only things touching the floor.
+ */
+function csShipPrepPreferSolidBase(mesh, keepX, keepZ) {
+  if (!mesh || typeof THREE === 'undefined') return { contact: 0, tipGapMm: 1e9 };
+  const kx = keepX != null ? keepX : mesh.position.x;
+  const kz = keepZ != null ? keepZ : mesh.position.z;
+  const sc = (typeof SCALE === 'number' && SCALE > 0) ? SCALE : 0.01;
+
+  const nail = () => {
+    mesh.position.x = kx;
+    mesh.position.z = kz;
+    mesh.position.y = 0;
+    mesh.updateMatrixWorld(true);
+    csShipPrepNailGround(mesh);
+    mesh.position.x = kx;
+    mesh.position.z = kz;
+    mesh.updateMatrixWorld(true);
+  };
+  const measure = () => {
+    mesh.updateMatrixWorld(true);
+    const b = new THREE.Box3().setFromObject(mesh);
+    if (!isFinite(b.min.x)) return null;
+    const l = (b.max.x - b.min.x) / sc;
+    const w = (b.max.z - b.min.z) / sc;
+    const h = (b.max.y - b.min.y) / sc;
+    const tip = csShipPrepTipGapMm(mesh);
+    const contact = csShipPrepFloorContactFrac(mesh);
+    // Length must stay the long axis (no standing on end).
+    if (h >= Math.max(l, w) * 0.85) return null;
+    return { l, w, h, tip, contact };
+  };
+
+  nail();
+  const start = measure();
+  // Roll about the CURRENT length axis (world X or Z) — after tip-level the
+  // long member may lie on either horizontal axis, so hard-coding Rx is wrong.
+  const alongX = !start || start.l >= start.w;
+  const axis = alongX
+    ? new THREE.Vector3(1, 0, 0)
+    : new THREE.Vector3(0, 0, 1);
+
+  const baseQ = mesh.quaternion.clone();
+  let best = null;
+  let bestQ = baseQ.clone();
+  // 0/90/180/270 about length — four ways to lay a long member down.
+  const rolls = [0, Math.PI / 2, Math.PI, -Math.PI / 2];
+  for (let i = 0; i < rolls.length; i++) {
+    mesh.quaternion.copy(baseQ);
+    if (rolls[i]) {
+      mesh.quaternion.premultiply(new THREE.Quaternion()
+        .setFromAxisAngle(axis, rolls[i]));
+    }
+    mesh.rotation.setFromQuaternion(mesh.quaternion);
+    nail();
+    const m = measure();
+    if (!m) continue;
+    // Prefer solid floor contact, then low tip, then low height (flat base).
+    const score = m.contact * 1e6 - m.tip * 200 - m.h * 0.5;
+    if (!best || score > best.score) {
+      best = { score, ...m };
+      bestQ = mesh.quaternion.clone();
+    }
+  }
+  mesh.quaternion.copy(bestQ);
+  mesh.rotation.setFromQuaternion(bestQ);
+  nail();
+  const final = measure() || { contact: 0, tip: 1e9, h: 0 };
+  return {
+    contact: final.contact,
+    tipGapMm: final.tip,
+    heightMm: final.h,
+  };
+}
+
+/**
  * Brute-force a flat shipping seat: try pitch/roll steps and keep the pose
  * with the smallest bottom-Y span (tip gap) that is not standing on end.
  */
@@ -378,6 +496,133 @@ function csShipPrepStandOnEdge(mesh, it) {
   return true;
 }
 
+/**
+ * If the current pose does not fit the container AABB, rotate to the best
+ * fitting seat (lowest tip among poses that enter). Used for kinked rafters
+ * whose max-flat plan is wider than the box.
+ */
+function csShipPrepEnsureFitsContainer(mesh, it, keepX, keepZ, tipGap0) {
+  if (!mesh || typeof THREE === 'undefined') {
+    return { changed: false, tipGapMm: tipGap0 || 1e9, method: null };
+  }
+  const sc = (typeof SCALE === 'number' && SCALE > 0) ? SCALE : 0.01;
+  let Wcap = 2438, Hcap = 2690, Lcap = 12192;
+  try {
+    if (typeof rawScene !== 'undefined' && rawScene && rawScene.containerSpec) {
+      if (+rawScene.containerSpec.widthMm > 500) Wcap = +rawScene.containerSpec.widthMm;
+      if (+rawScene.containerSpec.heightMm > 500) Hcap = +rawScene.containerSpec.heightMm;
+      if (+rawScene.containerSpec.lengthMm > 500) Lcap = +rawScene.containerSpec.lengthMm;
+    }
+  } catch (_) { /* */ }
+  const kx = keepX != null ? keepX : mesh.position.x;
+  const kz = keepZ != null ? keepZ : mesh.position.z;
+
+  const nail = () => {
+    mesh.position.x = kx;
+    mesh.position.z = kz;
+    mesh.position.y = 0;
+    mesh.updateMatrixWorld(true);
+    csShipPrepNailGround(mesh);
+    mesh.position.x = kx;
+    mesh.position.z = kz;
+    mesh.updateMatrixWorld(true);
+  };
+  const measure = () => {
+    mesh.updateMatrixWorld(true);
+    const b = new THREE.Box3().setFromObject(mesh);
+    if (!isFinite(b.min.x)) return null;
+    const l = (b.max.x - b.min.x) / sc;
+    const w = (b.max.z - b.min.z) / sc;
+    const h = (b.max.y - b.min.y) / sc;
+    const tip = csShipPrepTipGapMm(mesh);
+    const fit = l <= Lcap + 1 && w <= Wcap + 1 && h <= Hcap + 1;
+    return { l, w, h, tip, fit };
+  };
+
+  nail();
+  let cur = measure();
+  if (cur && cur.fit) {
+    return { changed: false, tipGapMm: cur.tip, method: null };
+  }
+
+  const keepQ = mesh.quaternion.clone();
+  let best = null;
+  let bestQ = keepQ.clone();
+
+  // 1) refineAssemblyGroundPose — known to find RF012 ≈ 11.6×0.87×2.4 m
+  if (typeof refineAssemblyGroundPose === 'function') {
+    try {
+      refineAssemblyGroundPose(mesh, it || {}, null);
+      mesh.position.x = kx;
+      mesh.position.z = kz;
+      nail();
+      const m = measure();
+      if (m && m.fit) {
+        best = m;
+        bestQ = mesh.quaternion.clone();
+      }
+    } catch (_) { /* */ }
+  }
+
+  // 2) Align to IFC construct axes if still needed
+  if ((!best || !best.fit) && typeof alignMeshToPackFootprint === 'function') {
+    mesh.quaternion.copy(keepQ);
+    mesh.rotation.setFromQuaternion(keepQ);
+    nail();
+    let iL = +(it && it.lengthMm) || 0;
+    let iW = +(it && it.widthMm) || 0;
+    let iH = +(it && it.heightMm) || 0;
+    if (typeof cs8NormalizeAssemblyShipAxes === 'function' && iL > 0) {
+      const ax = cs8NormalizeAssemblyShipAxes(iL, iW, iH, it || {});
+      if (ax) { iL = ax.l; iW = ax.w; iH = ax.h; }
+    }
+    if (iL > 500 && iW >= 40 && iW <= Wcap + 1 && iH >= 40 && iH <= Hcap + 1) {
+      const probe = {
+        ...(it || {}),
+        packFootprintL: iL,
+        packFootprintW: iW,
+        packFootprintH: iH,
+      };
+      try {
+        alignMeshToPackFootprint(mesh, probe);
+        mesh.position.x = kx;
+        mesh.position.z = kz;
+        nail();
+        const m = measure();
+        if (m && m.fit && (!best || m.tip < best.tip - 0.5)) {
+          best = m;
+          bestQ = mesh.quaternion.clone();
+        }
+      } catch (_) { /* */ }
+    }
+  }
+
+  if (best && best.fit) {
+    mesh.quaternion.copy(bestQ);
+    mesh.rotation.setFromQuaternion(bestQ);
+    nail();
+    const final = measure() || best;
+    if (it) it._shipFitRotated = true;
+    return {
+      changed: true,
+      tipGapMm: final.tip,
+      method: 'assembly_ship_prep_fit_rotate',
+      dims: { l: final.l, w: final.w, h: final.h },
+    };
+  }
+
+  // Restore flat attempt — honest leftover
+  mesh.quaternion.copy(keepQ);
+  mesh.rotation.setFromQuaternion(keepQ);
+  nail();
+  cur = measure();
+  return {
+    changed: false,
+    tipGapMm: cur ? cur.tip : (tipGap0 || 1e9),
+    method: null,
+  };
+}
+
 /** Stamp ship-prep fields onto item from live mesh. */
 function csShipPrepStamp(it, mesh, cls, tipGapMm) {
   if (!it || !mesh) return;
@@ -402,9 +647,12 @@ function csShipPrepStamp(it, mesh, cls, tipGapMm) {
       source: 'ship_prep',
       tipGapMm: it.tipGapMm,
     };
-    // Mesh max-flat can still exceed 40ft W (pitched plan AABB). Prefer IFC
-    // construct axes — same remap as W.12d3/d4 — stamped as ship_prep.
+    // Mesh max-flat can still exceed 40ft W. ONLY remap to IFC construct axes
+    // when the live mesh is still pitched — never when tip is already flat.
+    // Replacing a flat seat (tip ~30, w ~4400) with construct axes (w=200,
+    // h=2508, tip ~1790) is what put roof-pitch rafters back in the container.
     if ((sb.w > 2438 + 1 || sb.h > 2690 + 1)
+        && !(it.tipGapMm <= 80 && sb.h <= Math.max(sb.l, sb.w) * 0.45)
         && typeof cs8SanitizePitchedAssemblyEnvelope === 'function') {
       const memberL = Math.max(
         +it.lengthMm || 0, +it.widthMm || 0, +it.heightMm || 0,
@@ -613,27 +861,24 @@ function csShipPrepMesh(mesh, it) {
       tipGapMm = csShipPrepForceFlat(mesh, keepX, keepZ, tipGapMm);
       method = 'assembly_ship_prep_force_flat';
     }
-    csShipPrepNailGround(mesh);
-    // If max-flat AABB still exceeds 40ft W, try refineAssemblyGroundPose once
-    // (may pick construct / mid-height seat that fits without inventing dims).
+    // Cleats / tabs must not be the only floor contact — roll onto the solid
+    // web or flange so the piece can act as a real base for the next item.
     {
-      const sc0 = (typeof SCALE === 'number' && SCALE > 0) ? SCALE : 0.01;
-      mesh.updateMatrixWorld(true);
-      const b0 = new THREE.Box3().setFromObject(mesh);
-      const w0 = (b0.max.z - b0.min.z) / sc0;
-      const h0 = (b0.max.y - b0.min.y) / sc0;
-      if ((w0 > 2438 + 1 || h0 > 2690 + 1)
-          && typeof refineAssemblyGroundPose === 'function') {
-        try {
-          refineAssemblyGroundPose(mesh, it, null);
-          mesh.position.x = keepX;
-          mesh.position.z = keepZ;
-          csShipPrepNailGround(mesh);
-          const tip2 = csShipPrepTipLevel(mesh, keepX, keepZ);
-          tipGapMm = tip2.tipGapMm;
-          method = 'assembly_ship_prep_refine';
-        } catch (_) { /* */ }
-      }
+      const solid = csShipPrepPreferSolidBase(mesh, keepX, keepZ);
+      tipGapMm = solid.tipGapMm;
+      it._shipFloorContact = solid.contact;
+      method = 'assembly_ship_prep_solid_base';
+    }
+    csShipPrepNailGround(mesh);
+    tipGapMm = csShipPrepTipGapMm(mesh);
+    // Prefer absolute-flat when it FITS the box. If the flat seat is wider /
+    // taller than the container (kinked rafter plan), rotate to the flattest
+    // pose that still enters — that is what a human does with the second image
+    // (turn the piece until it goes in), instead of leaving FOOTPRINT_EXCEEDS.
+    {
+      const fit = csShipPrepEnsureFitsContainer(mesh, it, keepX, keepZ, tipGapMm);
+      tipGapMm = fit.tipGapMm;
+      if (fit.changed) method = fit.method || 'assembly_ship_prep_fit';
     }
     if (csShipPrepStandOnEdge(mesh, it)) {
       mesh.position.x = keepX;
@@ -663,7 +908,7 @@ function csShipPrepMesh(mesh, it) {
     return { ok: true, class: cls, tipGapMm, method };
   }
 
-  // plate / rod / beam / other — yard straighten when available, else nail
+  // plate / rod / beam / other — same flat + solid-base rule as assemblies
   method = 'flat_ground';
   if (typeof straightenYardItemOnGround === 'function' && !csShipPrepIsZ(it)) {
     it._yardStraighten = true;
@@ -678,6 +923,13 @@ function csShipPrepMesh(mesh, it) {
       tipGapMm = csShipPrepForceFlat(mesh, keepX, keepZ, tipGapMm);
       method = 'flat_ground_force_flat';
     }
+  }
+  // Every long piece (not just welded assemblies): solid face down, cleats up.
+  {
+    const solid = csShipPrepPreferSolidBase(mesh, keepX, keepZ);
+    tipGapMm = solid.tipGapMm;
+    it._shipFloorContact = solid.contact;
+    method = 'flat_ground_solid_base';
   }
   csShipPrepNailGround(mesh);
   // Deep assemblies land here too when their section reads as a plain beam.
@@ -776,19 +1028,40 @@ function csShipPrepPosedMesh(it, color, opacity) {
     // different shape from the one Optimise reserved space for.
     const rec = it._shipPrepDimsMm || null;
     const cls = (rec && rec.cls) || csShipPrepClass(it);
+    const freeze = !!(it._pack25dFreezePose || it._pack25dPoseLocked
+      || (it._packV2Applied && it._groupByQuat && it._shipPrepped));
     const mesh = makeShape({
       ...it,
       lengthMm: (rec && rec.l) || it.lengthMm || it.l || 500,
       widthMm: (rec && rec.w) || it.widthMm || it.w || 200,
       heightMm: (rec && rec.h) || it.heightMm || it.h || 200,
       qty: (rec && rec.qty) || it.qty || 1,
-      _yardStraighten: cls !== 'nest_z',
-      _keepGroupByBundle: cls === 'nest_z' || cls === 'nest_c' || cls === 'nest_l',
+      _yardStraighten: !freeze && cls !== 'nest_z',
+      _keepGroupByBundle: cls === 'nest_z' || cls === 'nest_c' || cls === 'nest_l'
+        || freeze,
       assemblyShipPose: cls === 'assembly',
-      _skipStability: false,
+      _skipStability: !!freeze,
+      _freezeGroupByPose: freeze || !!it._freezeGroupByPose,
     }, color, opacity);
     if (!mesh) return null;
+    // Deterministic 2.5D / Pack V2: replay frozen quat only — no tip/pitch search
+    if (freeze && it._groupByQuat && typeof applyGroupByFrozenQuat === 'function') {
+      applyGroupByFrozenQuat(mesh, it);
+      if (typeof csShipPrepNailGround === 'function') csShipPrepNailGround(mesh);
+      try {
+        it._orientLocked = true;
+        it._lockedQuaternion = mesh.quaternion.clone();
+      } catch (_) { /* */ }
+      return mesh;
+    }
     csShipPrepMesh(mesh, { ...it });
+    // After first successful prep, lock quat so later Optimise redraws freeze
+    try {
+      if (it._groupByQuat) {
+        it._pack25dPoseLocked = true;
+        it._shipPrepped = true;
+      }
+    } catch (_) { /* */ }
     return mesh;
   } catch (e) {
     try { console.warn('[ship-prep pose]', it.mark, e); } catch (_) { /* */ }

@@ -129,9 +129,12 @@ function csPackV2IsStackableUnit(u) {
     const sk = String(u.shapeKey || u.profileShape || '').toLowerCase();
     if (gk === 'stack_plate' || gk === 'plate' || sk === 'plate') return true;
     if (csPackIsAssemblyUnit(u) || gk === 'welded_assembly' || gk === 'assembly_single') {
-        const { ph } = csPackV2Foot(u);
-        // Keep tall upright members on the floor only.
-        return !(ph > 1200);
+        const { pw, ph } = csPackV2Foot(u);
+        // Flat shipping assemblies may climb a layer. Only refuse true upright
+        // towers (taller than wide and over ~1.2 m) — those stay on the floor.
+        if (!(ph > 0)) return false;
+        if (ph <= 1200) return true;
+        return pw + CSPACK_V2_EPS >= ph * 0.85 && ph <= 1800;
     }
     return false;
 }
@@ -191,15 +194,33 @@ function csPackNormalizePackUnit(u, opts) {
     // Ship prep measured this seat off the posed mesh, and that same mesh is
     // what the renderer draws. Re-deriving a seat that already fits means
     // planning one pose and drawing another, which is how pieces end up hanging
-    // through the container wall. Only re-derive a seat that cannot be shipped
-    // as measured.
+    // through the container wall.
+    //
+    // IMPORTANT: a FLAT ship-prep seat that is wider than the box (kinked
+    // rafter laid down) must KEEP those dims — remapping to IFC construct
+    // axes (w=200, h=2508) invents a tall "carrier" that fills the floor,
+    // bans stacking (TALL_CARRIER), and leaves the top of the box empty.
+    // Over-wide flat seats become honest FOOTPRINT_EXCEEDS leftovers instead.
     const Hcap = csPackContainerHeightMm(opts && opts.containerSpec);
     const sbFit = u.stableBundleMm || null;
-    const measuredSeat = !!sbFit
-        && /ship_prep/i.test(String(sbFit.source || ''))
+    const sbTip = sbFit && sbFit.tipGapMm != null ? +sbFit.tipGapMm
+        : (u.tipGapMm != null ? +u.tipGapMm : null);
+    // Flat = low tip + height is the thin axis (≤ ~half the shorter plan side)
+    // and under ~1.2 m. A pitched AABB like 11.8×11.6×2.6 m is NOT flat even
+    // though H < 0.45·L — that used to skip ship-axis repair (A2).
+    const sbIsFlat = !!sbFit
         && +sbFit.l > 0 && +sbFit.w > 0 && +sbFit.h > 0
-        && +sbFit.w <= Wcap + CSPACK_V2_EPS
-        && +sbFit.h <= Hcap + CSPACK_V2_EPS;
+        && +sbFit.h <= Math.min(+sbFit.l, +sbFit.w) * 0.55 + CSPACK_V2_EPS
+        && +sbFit.h <= 1200 + CSPACK_V2_EPS
+        && (sbTip == null || sbTip <= 80);
+    const measuredSeat = !!sbFit
+        && /ship_prep|yard_straighten/i.test(String(sbFit.source || ''))
+        && +sbFit.l > 0 && +sbFit.w > 0 && +sbFit.h > 0
+        && (
+            sbIsFlat
+            || (+sbFit.w <= Wcap + CSPACK_V2_EPS
+                && +sbFit.h <= Hcap + CSPACK_V2_EPS)
+        );
     if (measuredSeat) {
         // Take the measurement verbatim; the max() blend above can only inflate
         // it, and widthMm/heightMm are rewritten from pw/ph further down.
@@ -221,10 +242,11 @@ function csPackNormalizePackUnit(u, opts) {
         } else if (shipL > 500 && shipW >= 40 && shipW <= Wcap + 50 && shipH >= 40) {
             pl = shipL; pw = shipW; ph = shipH;
             reason = 'asm_shipping_fields';
-        } else if (typeof cs8NormalizeAssemblyShipAxes === 'function'
+        } else if (!sbIsFlat && typeof cs8NormalizeAssemblyShipAxes === 'function'
             && (typeof cs8IsAbsurdAssemblyFootprint !== 'function'
                 || cs8IsAbsurdAssemblyFootprint(pl, pw, ph, u)
                 || pw > Wcap + CSPACK_V2_EPS)) {
+            // Never remap a flat shipping seat back into roof-pitch axes.
             const ax = cs8NormalizeAssemblyShipAxes(pl, pw, ph, {
                 ...u,
                 containerSpec: opts && opts.containerSpec,
@@ -7425,9 +7447,12 @@ function csPackV2StampViewerPoseOnItem(item, pose, placement, opts) {
     item.outsideContainer = false;
     item._packV2Applied = true;
     item._packV2FootYMm = pose.footYMm;
-
-    // Twin assemblies: enable existing twin render lane (steel W seat, not fat IFC AABB)
-    if (role === 'twin_wall_hug' || role === 'twin_beside') {
+    // Deterministic 2.5D — render must not re-tip / physics-settle this seat
+    item._pack25dFreezePose = true;
+    if (placement && placement.freezePose) item._pack25dPoseLocked = true;
+    if (role === 'twin_wall_hug' || role === 'twin_beside'
+        || role === 'twin_spine' || role === 'floor_spine'
+        || role === 'floor_spine_single') {
         item._pairLaneLock = true;
         item._pairPreferIfcMesh = true;
         item._pairVisW = pose.pw;
@@ -9003,12 +9028,12 @@ function csPackV2SortHumanOrder(units) {
 }
 
 /**
- * Pack like a human on the yard:
- *  1. Take the next unit in staging order (1, then 2, then 3…).
- *  2. Seat it horizontally on the floor if a stable slot exists.
- *  3. Only then try stacking it on a heavier / equal support.
- *  4. Never jump the order for twin lanes or strip reserves — those paths
- *     stood rafters upright and left empty floor while later numbers waited.
+ * Pack like a human on the yard — LAYER BY LAYER in staging order:
+ *  1. Take the next unit (1, then 2, then 3…).
+ *  2. Seat it on the floor if a stable slot exists.
+ *  3. If the floor is full, seat it on top of an already-placed heavier /
+ *     equal pad (next layer) — do NOT dump it outside while height remains.
+ *  4. Never jump the order for twin lanes or strip reserves.
  *
  * @returns pack result compatible with PackWithTwins / RunOptimise
  */
@@ -9018,58 +9043,135 @@ function csPackV2PackHuman(units, opts) {
     const ordered = csPackV2SortHumanOrder(units);
     const init = csPackV2InitialFreeRects(o.containerSpec);
     const env = o.envelope || init.envelope;
+    // Human loads: pieces nearly touch (5 mm). 20 mm left visible air gaps.
     const gapMm = (o.gapMm != null)
         ? Math.max(0, +o.gapMm)
-        : Math.max(0, +(env.bundleGapMm != null ? env.bundleGapMm : 20));
+        : 5;
 
-    // Floor first, in order. Yaw 0/90 only — never pitch a piece into the box.
-    const floor = csPackV2PackFloor(ordered, {
-        containerSpec: o.containerSpec,
-        envelope: env,
-        gapMm,
-        allowYaw: o.allowYaw !== false,
-    });
+    let freeRects = (init.freeRects || []).slice();
+    const placed = [];
+    const unplaced = [];
+    const placedBoxes = [];
+    const stackedPlacements = [];
+    // Use the full clear height (small headroom). The old 45%/1200 mm cap left
+    // the upper ~half of the box empty while leftovers piled outside.
+    const humanMaxTop = Math.max(0, +env.heightMm - 40);
+    const humanMaxTiers = (o.maxTiers != null)
+        ? Math.max(1, +o.maxTiers)
+        : CSPACK_V2_STACK_MAX_TIERS;
 
-    let placed = (floor.placed || []).slice();
-    let unplaced = (floor.unplaced || []).slice();
-    let stackPass = null;
+    let feasibleCount = 0;
+    let feasiblePlaced = 0;
+    let absurdFootprintCount = 0;
 
-    if (enableStacks && typeof csPackV2PlaceNestStacks === 'function') {
-        // Only leftovers may climb — and only onto a heavier / equal pad
-        // (HEAVIER_THAN_BASE is enforced inside the stack candidate rules).
-        // Human loads stay low: max 2 tiers and never above ~half the box, or
-        // thin nests climb to the roof and look like they are floating.
-        const leftUnits = unplaced.map(u => u && (u.unit || u)).filter(Boolean);
-        const humanMaxTop = Math.min(+env.heightMm * 0.45, 1200);
-        stackPass = csPackV2PlaceNestStacks(leftUnits, placed, {
+    for (let i = 0; i < ordered.length; i++) {
+        const unit = ordered[i];
+        if (!unit) continue;
+
+        const foot = csPackV2Foot(unit);
+        const absurd = (typeof cs8IsAbsurdAssemblyFootprint === 'function')
+            ? cs8IsAbsurdAssemblyFootprint(foot.pl, foot.pw, foot.ph, unit)
+            : (foot.pw > env.widthMm + CSPACK_V2_EPS
+                && foot.pl > env.widthMm * 0.5);
+        if (absurd) absurdFootprintCount++;
+        const feasible = foot.ph <= env.heightMm + CSPACK_V2_EPS
+            && foot.pl <= env.lengthMm + CSPACK_V2_EPS
+            && foot.pw <= env.widthMm + CSPACK_V2_EPS
+            && !absurd;
+        if (feasible) feasibleCount++;
+
+        // ── 1) Floor seat in current free rects ───────────────────────────
+        const found = csPackV2FindFloorSeat(unit, freeRects, {
             envelope: env,
-            containerSpec: o.containerSpec,
-            bearingMin: o.bearingMin,
-            maxTiers: 2,
-            maxSupportTopMm: humanMaxTop,
+            placedBoxes,
+            allowYaw: o.allowYaw !== false,
         });
-        placed = (stackPass.placed || placed).slice();
-        const stackedUids = new Set(
-            (stackPass.stacked || []).map(p => p && p._fmUid).filter(v => v != null));
-        unplaced = unplaced.filter(u => {
-            const uid = u && (u._fmUid != null ? u._fmUid
-                : (u.unit && u.unit._fmUid));
-            return uid == null || !stackedUids.has(uid);
-        });
-        (stackPass.stillUnplaced || []).forEach(u => {
-            if (!u) return;
-            const uid = u._fmUid != null ? u._fmUid
-                : (u.unit && u.unit._fmUid);
-            if (uid != null && unplaced.some(x =>
-                (x._fmUid != null ? x._fmUid : (x.unit && x.unit._fmUid)) === uid))
-                return;
-            unplaced.push({
-                unit: u.unit || u,
-                _fmUid: uid,
-                mark: u.mark || (u.unit && u.unit.mark) || null,
-                fitReason: u.reason || u.fitReason || 'NO_STACK',
-                fitReasonMsg: u.fitReasonMsg || u.reason || 'No stable stack seat',
+        if (found.ok) {
+            const packUnit = found.viewUnit || unit;
+            const commit = csPackV2CommitFloorSeat(packUnit, found.seat, {
+                envelope: env,
+                rect: found.rect,
+                placedBoxes,
             });
+            if (commit.ok && commit.placement) {
+                const applied = csPackV2ApplySplit(
+                    freeRects, found.rect, commit.placement, {
+                        gapMm,
+                        preferSideLane: true,
+                    });
+                if (!applied.ok) {
+                    freeRects = freeRects.filter(r => r !== found.rect
+                        && !(r && found.rect && r.id === found.rect.id));
+                } else {
+                    freeRects = applied.freeRects;
+                }
+                placedBoxes.push(commit.placement.box);
+                unit.fitReason = null;
+                unit.fitReasonMsg = null;
+                placed.push({
+                    ...commit.placement,
+                    unit,
+                    yawDeg: found.yawDeg || 0,
+                    corner: found.corner || null,
+                    rectId: found.rect && found.rect.id,
+                });
+                if (feasible) feasiblePlaced++;
+                continue;
+            }
+        }
+
+        // ── 2) Floor full → climb onto a heavier/equal pad (next layer) ───
+        if (enableStacks && placed.length
+            && typeof csPackV2PlaceNestStacks === 'function'
+            && csPackV2IsStackableUnit(unit)) {
+            const stackOne = csPackV2PlaceNestStacks([unit], placed, {
+                envelope: env,
+                containerSpec: o.containerSpec,
+                bearingMin: o.bearingMin,
+                maxTiers: humanMaxTiers,
+                maxSupportTopMm: humanMaxTop,
+            });
+            if (stackOne && stackOne.stacked && stackOne.stacked.length) {
+                // Replace working set with the stack pass result (includes prior).
+                placed.length = 0;
+                (stackOne.placed || []).forEach(p => placed.push(p));
+                placedBoxes.length = 0;
+                for (let b = 0; b < placed.length; b++) {
+                    if (placed[b] && placed[b].box) placedBoxes.push(placed[b].box);
+                }
+                stackedPlacements.push(...stackOne.stacked);
+                unit.fitReason = null;
+                unit.fitReasonMsg = null;
+                if (feasible) feasiblePlaced++;
+                continue;
+            }
+            const fail = (stackOne && stackOne.stillUnplaced
+                && stackOne.stillUnplaced[0]) || null;
+            const reason = (fail && (fail.reason || fail.fitReason)) || 'NO_STACK';
+            unit.fitReason = reason;
+            unit.fitReasonMsg = 'No stable stack seat on layer (' + reason + ')';
+            unplaced.push({
+                unit,
+                _fmUid: unit._fmUid != null ? unit._fmUid : null,
+                mark: unit.mark || null,
+                fitReason: reason,
+                fitReasonMsg: unit.fitReasonMsg,
+            });
+            continue;
+        }
+
+        // ── 3) Cannot floor or stack → honest leftover ────────────────────
+        const cls = csPackV2ClassifyUnplaced(unit, env, {
+            lastFailReason: found ? found.reason : 'NO_RECTS',
+        });
+        unit.fitReason = cls.fitReason;
+        unit.fitReasonMsg = cls.fitReasonMsg;
+        unplaced.push({
+            unit,
+            _fmUid: unit._fmUid != null ? unit._fmUid : null,
+            mark: unit.mark || null,
+            fitReason: cls.fitReason,
+            fitReasonMsg: cls.fitReasonMsg,
         });
     }
 
@@ -9120,6 +9222,7 @@ function csPackV2PackHuman(units, opts) {
 
     const stackCount = placed.filter(p =>
         p && (p.role === 'nest_stack' || p.layer === 'stack')).length;
+    const feasiblePlaceRate = feasibleCount > 0 ? feasiblePlaced / feasibleCount : 1;
 
     return {
         ok: true,
@@ -9137,7 +9240,7 @@ function csPackV2PackHuman(units, opts) {
         enableStacks,
         placed,
         unplaced,
-        freeRects: floor.freeRects || [],
+        freeRects,
         envelope: env,
         gapMm,
         placedCount: placed.length,
@@ -9149,12 +9252,24 @@ function csPackV2PackHuman(units, opts) {
         longNestPlacedCount: 0,
         stripReserveMm: 0,
         hasSideStrip: false,
-        feasibleCount: floor.feasibleCount,
-        feasiblePlaced: floor.feasiblePlaced,
-        feasiblePlaceRate: floor.feasiblePlaceRate,
-        absurdFootprintCount: floor.absurdFootprintCount,
-        stackPass,
-        floor,
+        feasibleCount,
+        feasiblePlaced,
+        feasiblePlaceRate,
+        absurdFootprintCount,
+        stackPass: {
+            stacked: stackedPlacements,
+            stackCount,
+            stillUnplaced: unplaced.slice(),
+        },
+        floor: {
+            placed: placed.filter(p => p && p.layer !== 'stack' && p.role !== 'nest_stack'),
+            unplaced,
+            freeRects,
+            feasibleCount,
+            feasiblePlaced,
+            feasiblePlaceRate,
+            absurdFootprintCount,
+        },
     };
 }
 
@@ -9186,21 +9301,61 @@ function csPackV2RunOptimise(opts) {
         };
     }
 
-    // Default = human order (1,2,3… horizontal + stable). Twin/strip path stays
-    // available for self-tests via packStrategy: 'twins'.
-    const pack = (o.packStrategy === 'twins')
-        ? csPackV2PackWithTwins(units, {
-            containerSpec: spec,
-            enableStacks,
-            bearingMin: o.bearingMin,
-            allowYaw: o.allowYaw,
-        })
-        : csPackV2PackHuman(units, {
+    // Default = deterministic 2.5D (twin floor spine → nests/plates, zero float).
+    // Fallbacks: binpack | human | twins via packStrategy.
+    let pack;
+    const strat = String(o.packStrategy || 'deterministic_25d');
+    if (strat === 'twins') {
+        pack = csPackV2PackWithTwins(units, {
             containerSpec: spec,
             enableStacks,
             bearingMin: o.bearingMin,
             allowYaw: o.allowYaw,
         });
+    } else if (strat === 'human'
+        || strat === 'pack_v2_human'
+        || o.packEngine === 'free_rect') {
+        pack = csPackV2PackHuman(units, {
+            containerSpec: spec,
+            enableStacks,
+            bearingMin: o.bearingMin,
+            allowYaw: o.allowYaw,
+        });
+    } else if (strat === 'binpack'
+        && typeof csBinPackPackHuman === 'function'
+        && (typeof csBinPackAvailable !== 'function' || csBinPackAvailable())) {
+        pack = csBinPackPackHuman(units, {
+            containerSpec: spec,
+            enableStacks,
+            bearingMin: o.bearingMin,
+            allowYaw: o.allowYaw,
+            gapMm: o.gapMm,
+        });
+    } else if (typeof csPack25dPack === 'function'
+        && (strat === 'deterministic_25d' || strat === '25d' || !o.packStrategy)) {
+        pack = csPack25dPack(units, {
+            containerSpec: spec,
+            enableStacks,
+            bearingMin: o.bearingMin != null ? o.bearingMin : 0.40,
+            gapMm: o.gapMm,
+        });
+    } else if (typeof csBinPackPackHuman === 'function'
+        && (typeof csBinPackAvailable !== 'function' || csBinPackAvailable())) {
+        pack = csBinPackPackHuman(units, {
+            containerSpec: spec,
+            enableStacks,
+            bearingMin: o.bearingMin,
+            allowYaw: o.allowYaw,
+            gapMm: o.gapMm,
+        });
+    } else {
+        pack = csPackV2PackHuman(units, {
+            containerSpec: spec,
+            enableStacks,
+            bearingMin: o.bearingMin,
+            allowYaw: o.allowYaw,
+        });
+    }
 
     const targets = units.map(u => ({ item: csPackV2MakeRenderItemFromUnit(u) }));
     const apply = csPackV2ApplyPlacementsToTargets(pack, targets, {
@@ -9259,9 +9414,13 @@ function csPackV2RunOptimise(opts) {
         oversized: leftoverItems,
         isOutsideView: false,
         isGroupedView: false,
-        packStrategy: pack.strategy === 'human_order'
-            ? 'pack_v2_human_order'
-            : 'pack_v2_twins_stacks',
+        packStrategy: pack.strategy === 'deterministic_25d'
+            ? 'deterministic_25d'
+            : (pack.strategy === 'binpack_human_order'
+                ? 'binpack_human_order'
+                : (pack.strategy === 'human_order'
+                    ? 'pack_v2_human_order'
+                    : 'pack_v2_twins_stacks')),
         packV2: pack,
         packV2Apply: apply,
         packV2Leftovers: leftovers,
