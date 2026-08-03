@@ -78,6 +78,17 @@ function csPackContainerWidthMm(spec) {
     return CSPACK_V2_DEFAULT_W;
 }
 
+function csPackContainerHeightMm(spec) {
+    const h = Number(spec && spec.heightMm);
+    if (h > 500) return h;
+    try {
+        if (typeof rawScene !== 'undefined' && rawScene && rawScene.containerSpec
+            && +rawScene.containerSpec.heightMm > 500)
+            return +rawScene.containerSpec.heightMm;
+    } catch (_) { /* */ }
+    return CSPACK_V2_DEFAULT_H;
+}
+
 function csPackIsNestUnit(u) {
     if (!u) return false;
     const gk = String(u.groupKind || '').toLowerCase();
@@ -102,6 +113,27 @@ function csPackIsAssemblyUnit(u) {
     return !!(u.isAssembly
         || u.groupKind === 'welded_assembly'
         || u.groupKind === 'assembly_single');
+}
+
+/**
+ * May this unit ride on top of another?
+ *
+ * Nests and plates always. Assemblies only when they are short enough to sit on
+ * a pad (not a tall wall) — a human will put a light frame on a heavy floor
+ * member once the floor is full, rather than leave the height empty.
+ */
+function csPackV2IsStackableUnit(u) {
+    if (!u) return false;
+    if (csPackIsNestUnit(u)) return true;
+    const gk = String(u.groupKind || '').toLowerCase();
+    const sk = String(u.shapeKey || u.profileShape || '').toLowerCase();
+    if (gk === 'stack_plate' || gk === 'plate' || sk === 'plate') return true;
+    if (csPackIsAssemblyUnit(u) || gk === 'welded_assembly' || gk === 'assembly_single') {
+        const { ph } = csPackV2Foot(u);
+        // Keep tall upright members on the floor only.
+        return !(ph > 1200);
+    }
+    return false;
 }
 
 /**
@@ -156,6 +188,24 @@ function csPackNormalizePackUnit(u, opts) {
         +u.heightMm || 0,
         0);
 
+    // Ship prep measured this seat off the posed mesh, and that same mesh is
+    // what the renderer draws. Re-deriving a seat that already fits means
+    // planning one pose and drawing another, which is how pieces end up hanging
+    // through the container wall. Only re-derive a seat that cannot be shipped
+    // as measured.
+    const Hcap = csPackContainerHeightMm(opts && opts.containerSpec);
+    const sbFit = u.stableBundleMm || null;
+    const measuredSeat = !!sbFit
+        && /ship_prep/i.test(String(sbFit.source || ''))
+        && +sbFit.l > 0 && +sbFit.w > 0 && +sbFit.h > 0
+        && +sbFit.w <= Wcap + CSPACK_V2_EPS
+        && +sbFit.h <= Hcap + CSPACK_V2_EPS;
+    if (measuredSeat) {
+        // Take the measurement verbatim; the max() blend above can only inflate
+        // it, and widthMm/heightMm are rewritten from pw/ph further down.
+        pl = +sbFit.l; pw = +sbFit.w; ph = +sbFit.h;
+    }
+
     // ── Assemblies: stamp + ship-axis sanitize (never nest-formula remorph) ─
     if (csPackIsAssemblyUnit(u) && !csPackIsNestUnit(u)) {
         if (!(pl > 0 && pw > 0 && ph > 0)) return { changed: false, reason: 'asm_incomplete' };
@@ -166,7 +216,9 @@ function csPackNormalizePackUnit(u, opts) {
         const shipW = +u.shippingWidthMm || +u.flangeWidthMm || 0;
         const shipH = +u.shippingHeightMm || 0;
         let reason = 'asm_stamp';
-        if (shipL > 500 && shipW >= 40 && shipW <= Wcap + 50 && shipH >= 40) {
+        if (measuredSeat) {
+            reason = 'asm_measured_seat';
+        } else if (shipL > 500 && shipW >= 40 && shipW <= Wcap + 50 && shipH >= 40) {
             pl = shipL; pw = shipW; ph = shipH;
             reason = 'asm_shipping_fields';
         } else if (typeof cs8NormalizeAssemblyShipAxes === 'function'
@@ -218,6 +270,25 @@ function csPackNormalizePackUnit(u, opts) {
     const isPlate = gk === 'stack_plate' || gk === 'plate' || sk === 'plate';
     if (isPlate && !csPackIsNestUnit(u)) {
         const before = `${u.packLengthMm}|${u.packWidthMm}|${u.packHeightMm}`;
+        if (measuredSeat) {
+            // The stack Group By built is what gets drawn, so reserve exactly
+            // that. Re-deriving from the mark reserved a stack's length as its
+            // height and left the seat taller than the bundle.
+            u.packLengthMm = pl;
+            u.packWidthMm = pw;
+            u.packHeightMm = ph;
+            u.packFootprintL = pl;
+            u.packFootprintW = pw;
+            u.packFootprintH = ph;
+            u.lengthMm = pl;
+            u.widthMm = pw;
+            u.heightMm = ph;
+            const afterM = `${u.packLengthMm}|${u.packWidthMm}|${u.packHeightMm}`;
+            return {
+                changed: before !== afterM,
+                reason: before !== afterM ? 'plate_measured_seat' : null,
+            };
+        }
         // Prefer thin axis as thickness (H); longest as L; remaining as W
         const dims = [pl, pw, ph].filter(v => v > 0).sort((a, b) => a - b);
         let tHint = Math.max(+u.sectT || 0, +u.sectH || 0);
@@ -230,13 +301,16 @@ function csPackNormalizePackUnit(u, opts) {
         if (mPair) {
             const a = +mPair[1];
             const b = +mPair[2];
-            plateL = Math.max(a, b);
-            plateW = Math.min(a, b);
-            // PL1.5*2500 → thickness 1.5, plan 2500 (may exceed container — honest)
-            if (/^PL/i.test(mark) && a < 20) {
+            if (/^PL/i.test(mark)) {
+                // "PL30*265" is thickness*width; the length is not in the mark,
+                // so it has to come from the measured plan. Reading it as L*W
+                // booked a 590 mm plate as 265 and let it stick out of the wall.
                 tHint = a;
-                plateL = b;
-                plateW = b; // square sheet
+                plateW = b;
+                plateL = Math.max(pl, pw, b);
+            } else {
+                plateL = Math.max(a, b);
+                plateW = Math.min(a, b);
             }
         }
         if (plateW > Wcap + CSPACK_V2_EPS && plateL > plateW) {
@@ -778,18 +852,24 @@ function csPackV2ContainerSpec(spec) {
     let L = Number(spec && spec.lengthMm) || 0;
     let W = Number(spec && spec.widthMm) || 0;
     let H = Number(spec && spec.heightMm) || 0;
+    // Payload rating travels with the spec — dropping it here let Optimise plan
+    // loads several times over what the container may carry.
+    let maxKg = Number(spec && spec.maxWeightKg) || 0;
     try {
         if (typeof rawScene !== 'undefined' && rawScene && rawScene.containerSpec) {
             const c = rawScene.containerSpec;
             if (!(L > 500)) L = +c.lengthMm || L;
             if (!(W > 500)) W = +c.widthMm || W;
             if (!(H > 500)) H = +c.heightMm || H;
+            if (!(maxKg > 0)) maxKg = +c.maxWeightKg || maxKg;
         }
     } catch (_) { /* */ }
     if (!(L > 500)) L = CSPACK_V2_DEFAULT_L;
     if (!(W > 500)) W = CSPACK_V2_DEFAULT_W;
     if (!(H > 500)) H = CSPACK_V2_DEFAULT_H;
-    return { lengthMm: L, widthMm: W, heightMm: H };
+    const out = { lengthMm: L, widthMm: W, heightMm: H };
+    if (maxKg > 0) out.maxWeightKg = maxKg;
+    return out;
 }
 
 /**
@@ -4378,9 +4458,30 @@ function csPackV2PlacementIsNestSupportSource(placement) {
         || placement.shapeKey || '');
     if (sk === 'z_channel' || sk === 'z_shape' || sk === 'c_channel' || sk === 'l_angle')
         return true;
-    // Assemblies never
-    if (placement.unit && csPackIsAssemblyUnit(placement.unit)) return false;
-    if (gk === 'welded_assembly' || gk === 'assembly_single') return false;
+    // Flat assemblies may carry something lighter — tall upright ones may not.
+    if ((placement.unit && csPackIsAssemblyUnit(placement.unit))
+        || gk === 'welded_assembly' || gk === 'assembly_single') {
+        const pw = +placement.pw > 0
+            ? +placement.pw
+            : (placement.box ? +placement.box.maxZ - +placement.box.minZ : 0);
+        const ph = +placement.ph > 0
+            ? +placement.ph
+            : (placement.box ? +placement.box.maxY - +placement.box.minY : 0);
+        return pw > 0 && ph > 0 && ph <= 1200 && pw + CSPACK_V2_EPS >= ph * 0.5;
+    }
+    // A seated plate or plate stack presents a broad flat top, which is a sound
+    // place to land more plates. Only while it is resting flat: a plate up on
+    // edge is taller than it is wide and carries nothing.
+    const isPlate = gk === 'stack_plate' || gk === 'plate' || sk === 'plate';
+    if (isPlate) {
+        const pw = +placement.pw > 0
+            ? +placement.pw
+            : (placement.box ? +placement.box.maxZ - +placement.box.minZ : 0);
+        const ph = +placement.ph > 0
+            ? +placement.ph
+            : (placement.box ? +placement.box.maxY - +placement.box.minY : 0);
+        return pw > 0 && ph > 0 && pw + CSPACK_V2_EPS >= ph;
+    }
     return false;
 }
 
@@ -4480,9 +4581,17 @@ function csPackV2BuildSupportMap(placed, envelope, opts) {
             pl, pw, ph,
             baseY: +p.box.minY,
             topY: +p.box.maxY,
+            // Own weight, so the stack rules can keep the heavy pieces underneath.
+            weightKg: Math.max(
+                +p.weightKg || 0,
+                +(p.unit && p.unit.weightKg) || 0,
+                +(p.unit && p.unit.total_weight) || 0, 0),
             capacityKg: cap,
             tier,
-            kind: 'nest',
+            kind: (/^nest_/i.test(String(
+                (p.unit && p.unit.groupKind) || p.groupKind || ''))
+                || (p.unit && csPackIsNestUnit(p.unit)))
+                ? 'nest' : 'flat',
             role: p.role || null,
             groupKind: (p.unit && p.unit.groupKind) || p.groupKind || null,
             shapeKey: (p.unit && (p.unit.shapeKey || p.unit.profileShape)) || null,
@@ -4777,6 +4886,7 @@ function csPackV2IsStackCandidate(unit, support, envelope, opts) {
     const design = {
         isNest: false,
         isAssembly: false,
+        isPlate: false,
         sameFamily,
         bearingFrac: null,
         bearingOk: null,
@@ -4786,6 +4896,8 @@ function csPackV2IsStackCandidate(unit, support, envelope, opts) {
         contactOk: null,
         heightOk: null,
         weightOk: null,
+        baseHeavierOk: null,
+        baseWeightKg: null,
         tallOk: null,
         supportOk: null,
         tierOk: null,
@@ -4813,12 +4925,18 @@ function csPackV2IsStackCandidate(unit, support, envelope, opts) {
 
     design.isNest = csPackIsNestUnit(unit);
     design.isAssembly = csPackIsAssemblyUnit(unit) && !design.isNest;
-    if (!design.isNest) {
+    // Plates, nests, and short assemblies may climb. Tall assemblies stay floor.
+    const gkU = String(unit.groupKind || '').toLowerCase();
+    const skU = String(unit.shapeKey || unit.profileShape || '').toLowerCase();
+    design.isPlate = !design.isNest
+        && (gkU === 'stack_plate' || gkU === 'plate' || skU === 'plate');
+    design.stackable = csPackV2IsStackableUnit(unit);
+    if (!design.stackable) {
         reasons.push(design.isAssembly ? 'NOT_NEST_ASSEMBLY' : 'NOT_NEST');
     }
 
-    // Support must be a nest pad (4a kind) and not tall
-    design.supportOk = support.kind === 'nest'
+    // Support must be a real pad (nest / flat assembly / plate) and not tall
+    design.supportOk = (support.kind === 'nest' || support.kind === 'flat')
         && +support.pl > 0 && +support.pw > 0
         && support.topY != null && +support.topY >= 0;
     if (!design.supportOk) reasons.push('BAD_SUPPORT');
@@ -4871,6 +4989,21 @@ function csPackV2IsStackCandidate(unit, support, envelope, opts) {
     design.capacityKg = cap;
     design.weightOk = wKg <= cap + 1e-6;
     if (!design.weightOk) reasons.push('WEIGHT');
+
+    // Heavy at the base. The capacity rule alone allows a piece several times
+    // heavier than the one under it, which is how a load ends up top-heavy: the
+    // centre of gravity climbs, the lower piece takes a load it was never
+    // measured for, and the stack racks in transit. A tolerance covers equal
+    // bundles that differ only by rounding. With no weight on record there is
+    // nothing to compare, so the capacity rule is left to decide alone.
+    const baseKg = Math.max(+support.weightKg || 0, 0);
+    design.baseWeightKg = baseKg || null;
+    if (baseKg > 0 && wKg > 0) {
+        design.baseHeavierOk = wKg <= baseKg + Math.max(5, baseKg * 0.02);
+        if (!design.baseHeavierOk) reasons.push('HEAVIER_THAN_BASE');
+    } else {
+        design.baseHeavierOk = null;
+    }
 
     const ok = reasons.length === 0;
     return {
@@ -4936,7 +5069,9 @@ function csPackV2Step4bSelfTest() {
         packLengthMm: 5000, packWidthMm: 200, packHeightMm: 300, weightKg: 400,
     };
     const r2 = csPackV2IsStackCandidate(asm, support, env, {});
-    check('R2', !r2.ok && (r2.reason === 'NOT_NEST_ASSEMBLY' || r2.reason === 'NOT_NEST'),
+    // Short assembly is stackable now, but 400 kg on a 300 kg base is refused.
+    check('R2', !r2.ok && (r2.reason === 'HEAVIER_THAN_BASE'
+        || r2.reason === 'NOT_NEST_ASSEMBLY' || r2.reason === 'NOT_NEST'),
         `ok=${r2.ok} r=${r2.reason}`);
 
     // R3: nest-on-rafter-tip (fake tall support) → false TALL_CARRIER
@@ -5450,7 +5585,8 @@ function csPackV2Step4cSelfTest() {
     const t4 = csPackV2TryStackSeat(asm, support, {
         envelope: env, placedBoxes: [basePl.box],
     });
-    check('T4', !t4.ok && (t4.reason === 'NOT_NEST_ASSEMBLY' || t4.reason === 'NOT_NEST'),
+    check('T4', !t4.ok && (t4.reason === 'HEAVIER_THAN_BASE'
+        || t4.reason === 'NOT_NEST_ASSEMBLY' || t4.reason === 'NOT_NEST'),
         `ok=${t4.ok} r=${t4.reason}`);
 
     // T5: shifted off pad → BEARING
@@ -6015,7 +6151,8 @@ function csPackV2PlaceNestStacks(units, placed, opts) {
 
     const nestLeftovers = csPackV2SortStackCandidates(
         (Array.isArray(units) ? units : []).filter(u =>
-            u && csPackIsNestUnit(u) && (u._fmUid == null || !placedUids.has(u._fmUid))));
+            u && csPackV2IsStackableUnit(u)
+            && (u._fmUid == null || !placedUids.has(u._fmUid))));
 
     const stacked = [];
     const stillUnplaced = [];
@@ -6265,10 +6402,10 @@ function csPackV2Step4eSelfTest() {
         && p4.accounted,
         `stack=${p4.stackCount} left=${p4.stillUnplacedCount} r=${p4reason}`);
 
-    // P5: assemblies in list ignored (not stacked, not in stillUnplaced nests)
+    // P5: tall assemblies stay off the stack pass (floor-only members)
     const asm = {
         _fmUid: 'asm1', mark: 'ASM', isAssembly: true, groupKind: 'welded_assembly',
-        packLengthMm: 5000, packWidthMm: 200, packHeightMm: 300, weightKg: 400,
+        packLengthMm: 5000, packWidthMm: 200, packHeightMm: 2400, weightKg: 400,
     };
     const p5 = csPackV2PlaceNestStacks([asm, up1], [floorA], { envelope: env });
     check('P5', p5.stackCount === 1
@@ -6296,12 +6433,23 @@ function csPackV2Step4eSelfTest() {
         _fmUid: 'hv', mark: 'HV', groupKind: 'nest_z', shapeKey: 'z_channel',
         packLengthMm: 7000, packWidthMm: 300, packHeightMm: 150, weightKg: 500,
     };
-    const p8 = csPackV2PlaceNestStacks([light, heavy], [floorA], { envelope: env });
+    // Base carries more than either, so this checks order alone (see P8b).
+    const floor8 = makeFloorNest('base8', 'BASE8', { weightKg: 600 });
+    const p8 = csPackV2PlaceNestStacks([light, heavy], [floor8], { envelope: env });
     check('P8', p8.stackCount === 2
         && p8.attempts[0] && p8.attempts[0]._fmUid === 'hv'
         && p8.attempts[0].ok
         && p8.attempts[1] && p8.attempts[1]._fmUid === 'lt',
         `order=${p8.attempts.map(a => a._fmUid).join(',')}`);
+
+    // P8b: heavy at the base — a piece heavier than its support is refused, and
+    // the lighter one still seats, so the load builds heavy-down.
+    const p8b = csPackV2PlaceNestStacks([light, heavy], [floorA], { envelope: env });
+    const hvTry = p8b.attempts.find(a => a._fmUid === 'hv');
+    check('P8b', p8b.stackCount === 1
+        && hvTry && !hvTry.ok && hvTry.reason === 'HEAVIER_THAN_BASE'
+        && p8b.stacked.some(s => s._fmUid === 'lt'),
+        `stack=${p8b.stackCount} hv=${hvTry && hvTry.reason}`);
 
     // P9: same-family preferred over other family when both pads exist
     // Place a C nest on floor beside (synthetic second support) + Z leftover
@@ -8657,6 +8805,342 @@ function csPackV2FormatOptimiseToast(pack, leftoverApply) {
  * @param {boolean}  [opts.checkedOnly=true]
  * @returns {{ ok, reason, pack, units, placedItems, leftoverItems, layout, toast, apply, leftovers }}
  */
+/**
+ * Trim an applied load down to the container's payload rating.
+ *
+ * Pack V2 seats by fit alone, so a dense steel load can sit entirely inside the
+ * walls and still be several times what the box is rated to carry. Over-cap
+ * pieces are re-stamped as leftovers with a WEIGHT_CAP reason and parked
+ * outside, exactly as a piece that could not be fitted geometrically.
+ *
+ * Rather than pick pieces to throw off, this walks the load in the packer's own
+ * priority order and keeps what the rating affords. A piece too heavy for the
+ * remaining budget is passed over and lighter pieces behind it are still
+ * considered, so the payload is spent instead of being blocked by one heavy
+ * piece. Supports are decided before whatever rests on them, and a stacked piece
+ * is only kept if its support was, so nothing is ever left floating.
+ *
+ * Keeping in priority order matters: the packer seats in the operator's pick
+ * order and heaviest-first, so the heavy structural pieces stay on the floor and
+ * the budget's remainder goes to the lighter pieces that ride on top.
+ *
+ * @returns {{ ok, capKg, loadKg, evicted, evictedKg, skipped }}
+ */
+function csPackV2EnforceWeightCap(targets, spec, opts) {
+    const o = opts || {};
+    const capKg = Math.max(+(spec && spec.maxWeightKg) || 0, 0);
+    const kgOf = csPackV2UnitWeightKg;
+
+    const items = [];
+    (targets || []).forEach((t, i) => {
+        const it = csPackV2TargetItem(t);
+        if (it && it._packV2Applied) items.push({ it, i });
+    });
+    let loadKg = items.reduce((s, r) => s + kgOf(r.it), 0);
+    if (!capKg || loadKg <= capKg + CSPACK_V2_EPS)
+        return { ok: true, capKg, loadKg, evicted: 0, evictedKg: 0, skipped: !capKg };
+
+    const env = o.envelope || csPackV2FloorEnvelope(spec);
+    const pack = o.pack || null;
+
+    // Who rests on whom, and how high off the floor each piece sits, so a
+    // support is always decided before the pieces it carries.
+    const supOf = new Map();
+    const tierOf = new Map();
+    ((pack && pack.placed) || []).forEach(p => {
+        if (!p) return;
+        const uid = (p._fmUid != null) ? p._fmUid : (p.unit && p.unit._fmUid);
+        if (uid == null) return;
+        if (p.supportUid != null) supOf.set(uid, p.supportUid);
+        tierOf.set(uid, p.box ? +p.box.minY || 0 : 0);
+    });
+
+    const order = items.slice().sort((a, b) => {
+        const fa = tierOf.get(a.it._fmUid) || 0;
+        const fb = tierOf.get(b.it._fmUid) || 0;
+        if (Math.abs(fa - fb) > 1) return fa - fb;
+        return a.i - b.i;
+    });
+
+    const kept = new Set();
+    const drop = [];
+    let keptKg = 0;
+    order.forEach(r => {
+        const uid = r.it._fmUid;
+        const w = kgOf(r.it);
+        const sup = supOf.get(uid);
+        const orphan = (sup != null) && !kept.has(sup);
+        if (!orphan && keptKg + w <= capKg + CSPACK_V2_EPS) {
+            kept.add(uid);
+            keptKg += w;
+        } else {
+            drop.push(r);
+        }
+    });
+
+    const capMsg = `Payload cap ${Math.round(capKg)} kg reached`;
+    const prevDims = [];
+    let seat = Math.max(+o.outsideSeatStart || 0, 0);
+    let evicted = 0;
+    let evictedKg = 0;
+    for (let k = 0; k < drop.length; k++) {
+        const it = drop[k].it;
+        const dims = {
+            pl: Math.max(+it.packFootprintL || +it.lengthMm || 1, 1),
+            pw: Math.max(+it.packFootprintW || +it.widthMm || 1, 1),
+            ph: Math.max(+it.packFootprintH || +it.heightMm || 1, 1),
+        };
+        let pose = { ok: false };
+        try {
+            pose = csPackV2ComputeOutsideSeat(seat, dims, env, { prevDims: prevDims.slice() });
+        } catch (_) { /* park without a seat rather than keep it over cap */ }
+        seat += 1;
+        prevDims.push(dims);
+        const kg = kgOf(it);
+        csPackV2StampLeftoverOnItem(it, {
+            _fmUid: it._fmUid,
+            mark: it.mark,
+            fitReason: 'WEIGHT_CAP',
+            fitReasonMsg: capMsg,
+            pl: dims.pl, pw: dims.pw, ph: dims.ph,
+        }, pose, { preserveDims: true });
+
+        // Keep the pack's own tallies honest so the toast and report cannot
+        // claim a piece is loaded after the cap sent it back out.
+        if (pack && Array.isArray(pack.placed)) {
+            const uid = it._fmUid;
+            const pi = pack.placed.findIndex(p => p && uid != null
+                && ((p._fmUid != null && p._fmUid === uid)
+                    || (p.unit && p.unit._fmUid === uid)));
+            if (pi >= 0) {
+                const p = pack.placed[pi];
+                pack.placed.splice(pi, 1);
+                if (!Array.isArray(pack.unplaced)) pack.unplaced = [];
+                pack.unplaced.push({
+                    unit: (p && p.unit) || null,
+                    _fmUid: uid,
+                    mark: it.mark || null,
+                    fitReason: 'WEIGHT_CAP',
+                    fitReasonMsg: capMsg,
+                });
+            }
+        }
+
+        loadKg -= kg;
+        evictedKg += kg;
+        evicted += 1;
+    }
+
+    if (pack) {
+        if (Array.isArray(pack.placed)) pack.placedCount = pack.placed.length;
+        if (Array.isArray(pack.unplaced)) pack.unplacedCount = pack.unplaced.length;
+        // Counters cached from the geometric pack have to be recounted, or the
+        // report claims stacks and twins that are no longer aboard.
+        if (Array.isArray(pack.placed)) {
+            pack.stackCount = pack.placed.filter(p =>
+                p && (p.role === 'nest_stack' || p.layer === 'stack')).length;
+            pack.longNestPlacedCount = pack.placed.filter(p =>
+                p && p.role === 'long_nest_strip').length;
+            pack.twinPairsPlaced = Math.floor(pack.placed.filter(p =>
+                p && (p.role === 'twin_wall_hug' || p.role === 'twin_beside')).length / 2);
+        }
+        pack.weightCapKg = capKg;
+        pack.weightLoadKg = Math.round(loadKg * 100) / 100;
+        pack.weightEvictedCount = evicted;
+        pack.weightEvictedKg = Math.round(evictedKg * 100) / 100;
+    }
+
+    return {
+        ok: true,
+        capKg,
+        loadKg: Math.round(loadKg * 100) / 100,
+        evicted,
+        evictedKg: Math.round(evictedKg * 100) / 100,
+        skipped: false,
+    };
+}
+
+/**
+ * One weight per unit, whichever field carries it.
+ *
+ * The render item is built by taking the largest weight found on the unit and on
+ * its source pack unit, so the payload budget has to read weight the same way or
+ * it admits a load the cap then has to unload again.
+ */
+function csPackV2UnitWeightKg(u) {
+    const pick = (o) => (o ? Math.max(
+        +o.weightKg || 0, +o.unitWeightKg || 0,
+        +o.weight || 0, +o.total_weight || 0, 0) : 0);
+    if (!u) return 0;
+    return Math.max(pick(u), pick(u._srcPackUnit));
+}
+
+/**
+ * Human load order: staging checkOrder (1, 2, 3…), then heavier first.
+ * A human loads the numbered sets in order; within a number the heavy piece
+ * goes down before the light one.
+ */
+function csPackV2SortHumanOrder(units) {
+    const list = (Array.isArray(units) ? units : []).slice();
+    list.sort((a, b) =>
+        (+a._checkOrder || 99999) - (+b._checkOrder || 99999)
+        || (csPackV2UnitWeightKg(b) - csPackV2UnitWeightKg(a))
+        || (csPackV2Foot(b).pl - csPackV2Foot(a).pl)
+        || String(a && a._fmUid || '').localeCompare(String(b && b._fmUid || '')));
+    return list;
+}
+
+/**
+ * Pack like a human on the yard:
+ *  1. Take the next unit in staging order (1, then 2, then 3…).
+ *  2. Seat it horizontally on the floor if a stable slot exists.
+ *  3. Only then try stacking it on a heavier / equal support.
+ *  4. Never jump the order for twin lanes or strip reserves — those paths
+ *     stood rafters upright and left empty floor while later numbers waited.
+ *
+ * @returns pack result compatible with PackWithTwins / RunOptimise
+ */
+function csPackV2PackHuman(units, opts) {
+    const o = opts || {};
+    const enableStacks = o.enableStacks !== false;
+    const ordered = csPackV2SortHumanOrder(units);
+    const init = csPackV2InitialFreeRects(o.containerSpec);
+    const env = o.envelope || init.envelope;
+    const gapMm = (o.gapMm != null)
+        ? Math.max(0, +o.gapMm)
+        : Math.max(0, +(env.bundleGapMm != null ? env.bundleGapMm : 20));
+
+    // Floor first, in order. Yaw 0/90 only — never pitch a piece into the box.
+    const floor = csPackV2PackFloor(ordered, {
+        containerSpec: o.containerSpec,
+        envelope: env,
+        gapMm,
+        allowYaw: o.allowYaw !== false,
+    });
+
+    let placed = (floor.placed || []).slice();
+    let unplaced = (floor.unplaced || []).slice();
+    let stackPass = null;
+
+    if (enableStacks && typeof csPackV2PlaceNestStacks === 'function') {
+        // Only leftovers may climb — and only onto a heavier / equal pad
+        // (HEAVIER_THAN_BASE is enforced inside the stack candidate rules).
+        const leftUnits = unplaced.map(u => u && (u.unit || u)).filter(Boolean);
+        stackPass = csPackV2PlaceNestStacks(leftUnits, placed, {
+            envelope: env,
+            containerSpec: o.containerSpec,
+            bearingMin: o.bearingMin,
+        });
+        placed = (stackPass.placed || placed).slice();
+        const stackedUids = new Set(
+            (stackPass.stacked || []).map(p => p && p._fmUid).filter(v => v != null));
+        unplaced = unplaced.filter(u => {
+            const uid = u && (u._fmUid != null ? u._fmUid
+                : (u.unit && u.unit._fmUid));
+            return uid == null || !stackedUids.has(uid);
+        });
+        (stackPass.stillUnplaced || []).forEach(u => {
+            if (!u) return;
+            const uid = u._fmUid != null ? u._fmUid
+                : (u.unit && u.unit._fmUid);
+            if (uid != null && unplaced.some(x =>
+                (x._fmUid != null ? x._fmUid : (x.unit && x.unit._fmUid)) === uid))
+                return;
+            unplaced.push({
+                unit: u.unit || u,
+                _fmUid: uid,
+                mark: u.mark || (u.unit && u.unit.mark) || null,
+                fitReason: u.reason || u.fitReason || 'NO_STACK',
+                fitReasonMsg: u.fitReasonMsg || u.reason || 'No stable stack seat',
+            });
+        });
+    }
+
+    // Gravity nail: every floor piece sits on y=0, every stack on its support.
+    for (let i = 0; i < placed.length; i++) {
+        const p = placed[i];
+        if (!p || !p.box) continue;
+        if (p.layer === 'stack' || p.role === 'nest_stack') {
+            const y = (p.supportTopY != null) ? +p.supportTopY : +p.y;
+            if (Number.isFinite(y)) {
+                p.y = y;
+                p.box.minY = y;
+                p.box.maxY = y + Math.max(+p.ph || 0, 0);
+                p.gravity = 'support_top';
+            }
+        } else {
+            p.y = 0;
+            p.box.minY = 0;
+            p.box.maxY = Math.max(+p.ph || 0, 0);
+            p.gravity = 'floor';
+            p.layer = p.layer || 'floor';
+        }
+    }
+
+    let allFloorY0 = true;
+    let allStacksOnSupport = true;
+    let allNoOverlap = true;
+    for (let i = 0; i < placed.length; i++) {
+        const p = placed[i];
+        if (!p) continue;
+        const isStack = p.role === 'nest_stack' || p.layer === 'stack';
+        if (isStack) {
+            if (!p.box
+                || Math.abs(+p.box.minY - +p.y) > CSPACK_V2_EPS
+                || (p.supportTopY != null
+                    && Math.abs(+p.y - +p.supportTopY) > CSPACK_V2_EPS)) {
+                allStacksOnSupport = false;
+            }
+        } else if (p.y !== 0 || !p.box || p.box.minY !== 0) {
+            allFloorY0 = false;
+        }
+        for (let j = i + 1; j < placed.length; j++) {
+            const q = placed[j];
+            if (p.box && q && q.box && csPackV2BoxesOverlap(p.box, q.box))
+                allNoOverlap = false;
+        }
+    }
+
+    const stackCount = placed.filter(p =>
+        p && (p.role === 'nest_stack' || p.layer === 'stack')).length;
+
+    return {
+        ok: true,
+        strategy: 'human_order',
+        designOk: allFloorY0 && allNoOverlap && allStacksOnSupport,
+        allFloorY0,
+        allStacksOnSupport,
+        allNoOverlap,
+        stackNoTwinDig: true,
+        twinGapOk: true,
+        twinFloorOk: true,
+        twinNoDig: true,
+        stripOk: true,
+        stripAcceptable: true,
+        enableStacks,
+        placed,
+        unplaced,
+        freeRects: floor.freeRects || [],
+        envelope: env,
+        gapMm,
+        placedCount: placed.length,
+        unplacedCount: unplaced.length,
+        stackCount,
+        twinCount: 0,
+        twinPairsPlaced: 0,
+        twinPlacedCount: 0,
+        longNestPlacedCount: 0,
+        stripReserveMm: 0,
+        hasSideStrip: false,
+        feasibleCount: floor.feasibleCount,
+        feasiblePlaced: floor.feasiblePlaced,
+        feasiblePlaceRate: floor.feasiblePlaceRate,
+        absurdFootprintCount: floor.absurdFootprintCount,
+        stackPass,
+        floor,
+    };
+}
+
 function csPackV2RunOptimise(opts) {
     const o = opts || {};
     const enableStacks = o.enableStacks !== false;
@@ -8685,18 +9169,29 @@ function csPackV2RunOptimise(opts) {
         };
     }
 
-    const pack = csPackV2PackWithTwins(units, {
-        containerSpec: spec,
-        enableStacks,
-        bearingMin: o.bearingMin,
-        allowYaw: o.allowYaw,
-    });
+    // Default = human order (1,2,3… horizontal + stable). Twin/strip path stays
+    // available for self-tests via packStrategy: 'twins'.
+    const pack = (o.packStrategy === 'twins')
+        ? csPackV2PackWithTwins(units, {
+            containerSpec: spec,
+            enableStacks,
+            bearingMin: o.bearingMin,
+            allowYaw: o.allowYaw,
+        })
+        : csPackV2PackHuman(units, {
+            containerSpec: spec,
+            enableStacks,
+            bearingMin: o.bearingMin,
+            allowYaw: o.allowYaw,
+        });
 
     const targets = units.map(u => ({ item: csPackV2MakeRenderItemFromUnit(u) }));
     const apply = csPackV2ApplyPlacementsToTargets(pack, targets, {
         containerSpec: spec,
         envelope: pack.envelope,
-        applyPackYaw: !!o.applyPackYaw,
+        // Human pack seats with yaw 0/90; the mesh must follow or a cross-wise
+        // piece is drawn along the container while its slot runs across it.
+        applyPackYaw: o.applyPackYaw !== false,
         moveMeshes: false, // layout → renderContainer builds meshes
     });
     const leftovers = csPackV2ApplyLeftoversToTargets(pack, targets, {
@@ -8705,13 +9200,23 @@ function csPackV2RunOptimise(opts) {
         moveMeshes: false,
     });
 
+    // A load that fits between the walls can still be far over what the
+    // container may legally carry, so cap the payload before it is reported.
+    const weightCap = (o.enforceWeightCap === false)
+        ? { skipped: true, evicted: 0, evictedKg: 0 }
+        : csPackV2EnforceWeightCap(targets, spec, {
+            pack,
+            envelope: pack.envelope,
+            outsideSeatStart: (leftovers && leftovers.applied) || 0,
+        });
+
     const placedItems = targets.map(t => t.item).filter(it => it && it._packV2Applied);
     const leftoverItems = targets.map(t => t.item).filter(it => it && it._packV2Leftover);
 
     let usedWeightKg = 0;
     let usedVol = 0;
     placedItems.forEach(it => {
-        usedWeightKg += Math.max(+it.weightKg || +it.unitWeightKg || +it.weight || 0, 0);
+        usedWeightKg += csPackV2UnitWeightKg(it);
         usedVol += Math.max(+it.packFootprintL || 1, 1)
             * Math.max(+it.packFootprintW || 1, 1)
             * Math.max(+it.packFootprintH || 1, 1);
@@ -8729,13 +9234,17 @@ function csPackV2RunOptimise(opts) {
             maxWeightKg,
             usedWeightKg: Math.round(usedWeightKg * 100) / 100,
             weightUtilizationPct: Math.round(usedWeightKg / maxWeightKg * 1000) / 10,
+            weightCappedCount: (weightCap && weightCap.evicted) || 0,
+            weightCappedKg: (weightCap && weightCap.evictedKg) || 0,
             volumeUtilizationPct: Math.round(usedVol / clearVol * 1000) / 10,
             items: placedItems,
         }],
         oversized: leftoverItems,
         isOutsideView: false,
         isGroupedView: false,
-        packStrategy: 'pack_v2_twins_stacks',
+        packStrategy: pack.strategy === 'human_order'
+            ? 'pack_v2_human_order'
+            : 'pack_v2_twins_stacks',
         packV2: pack,
         packV2Apply: apply,
         packV2Leftovers: leftovers,
@@ -8767,6 +9276,7 @@ function csPackV2RunOptimise(opts) {
         leftovers,
         enableStacks,
         report,
+        weightCap,
     };
     if (apply.missed > 0 && placedItems.length === 0)
         out.ok = false;
@@ -8833,11 +9343,12 @@ function csPackV2Step5dSelfTest() {
         checkOrder: 3,
     });
 
-    // --- D1 happy path: twins + nest ---
+    // --- D1 happy path: twins + nest (explicit twin strategy) ---
     const run1 = csPackV2RunOptimise({
         groups: [gTwinA, gTwinB, gNest],
         containerSpec: spec,
         enableStacks: true,
+        packStrategy: 'twins',
     });
     const hug = run1.placedItems.find(it => it.role === 'twin_wall_hug');
     const nestPl = run1.placedItems.find(it =>
@@ -9127,7 +9638,9 @@ function csPackV2BuildPackReport(packOrOpt, opts) {
     const report = {
         ok,
         reason: ok ? null : 'GATE_FAIL',
-        strategy: 'pack_v2_twins_stacks',
+        strategy: pack.strategy === 'human_order'
+            ? 'pack_v2_human_order'
+            : 'pack_v2_twins_stacks',
         unitCount,
         placedCount: pack.placedCount != null ? pack.placedCount : placed.length,
         unplacedCount: unCount,
@@ -9146,6 +9659,10 @@ function csPackV2BuildPackReport(packOrOpt, opts) {
         feasiblePlaceRate: pack.feasiblePlaceRate != null ? +pack.feasiblePlaceRate : null,
         weightKg: cont ? +cont.usedWeightKg || 0 : 0,
         weightUtilizationPct: cont ? +cont.weightUtilizationPct || 0 : 0,
+        // Pieces the payload cap sent back out after they had been seated, so
+        // callers can reconcile this report against the geometric pack counts.
+        weightCappedCount: cont ? +cont.weightCappedCount || 0 : 0,
+        weightCappedKg: cont ? +cont.weightCappedKg || 0 : 0,
         volumeUtilizationPct: cont ? +cont.volumeUtilizationPct || 0 : 0,
         leftovers: leftoverViews,
         leftoverByReason,
@@ -9304,7 +9821,9 @@ function csPackV2Step5eSelfTest() {
             packLengthMm: 9600, packWidthMm: 400, packHeightMm: 200, weightKg: 300,
         },
     ];
-    const optHappy = csPackV2RunOptimise({ units: unitsHappy, containerSpec: spec });
+    const optHappy = csPackV2RunOptimise({
+        units: unitsHappy, containerSpec: spec, packStrategy: 'twins',
+    });
     const repHappy = optHappy.report || csPackV2BuildPackReport(optHappy);
     check('E2', optHappy.ok && repHappy && repHappy.ok
         && repHappy.placedCount === optHappy.pack.placedCount
@@ -9846,7 +10365,9 @@ function csPackV2Step5fSelfTest(opts) {
             ],
         },
     ];
-    const optHappy = csPackV2RunOptimise({ units: happy, containerSpec: spec });
+    const optHappy = csPackV2RunOptimise({
+        units: happy, containerSpec: spec, packStrategy: 'twins',
+    });
     const soakHappy = csPackV2SoakInspect(optHappy, { containerSpec: spec });
 
     check('F1', soakHappy.ok && soakHappy.floatCount === 0 && soakHappy.digCount === 0,
@@ -9898,11 +10419,13 @@ function csPackV2Step5fSelfTest(opts) {
             && nearish(it.y, it._packV2FootYMm + it.packFootprintH * 0.5)),
         `n=${stackItems.length} feet=${stackItems.map(i => i._packV2FootYMm).join(',')}`);
 
-    // Twin wall-hug viewer Z near home
-    const hugIt = optOn.placedItems.find(it => it.role === 'twin_wall_hug');
-    const halfW = spec.widthMm * 0.5;
-    check('F6', hugIt && hugIt.z < -halfW + 400 && nearish(hugIt._packV2FootYMm, 0),
-        `z=${hugIt && hugIt.z} foot=${hugIt && hugIt._packV2FootYMm}`);
+    // Human pack: every floor piece nails to y=0 (no float). Twin hug is
+    // covered by F2 under packStrategy:'twins'.
+    const floorIts = optOn.placedItems.filter(it =>
+        it && it._packV2Applied && it.role !== 'nest_stack');
+    check('F6', floorIts.length >= 1
+        && floorIts.every(it => nearish(it._packV2FootYMm, 0)),
+        `n=${floorIts.length} feet=${floorIts.map(i => i._packV2FootYMm).slice(0, 4).join(',')}`);
 
     // Group By nest dims preserved on render items
     const nestIt = optHappy.placedItems.find(it =>
@@ -9921,6 +10444,7 @@ function csPackV2Step5fSelfTest(opts) {
         `rep=${optOn.report && optOn.report.summary}`);
 
     // Leftovers outside never dig into container (viewer)
+    const halfW = spec.widthMm * 0.5;
     check('F9', optOff.leftoverItems.every(it => it.outsideContainer
         && it.z > halfW && it.fitReason),
         `left=${optOff.leftoverItems.length}`);

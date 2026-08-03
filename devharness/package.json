@@ -1,0 +1,13 @@
+{
+  "name": "steelviewer-devharness",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Local web harness to run and screenshot the viewer UI outside WinForms",
+  "scripts": {
+    "serve": "node server.js",
+    "shoot": "node shoot.js"
+  },
+  "dependencies": {
+    "puppeteer-core": "^24.9.0"
+  }
+}

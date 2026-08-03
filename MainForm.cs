@@ -483,6 +483,22 @@ public class MainForm : Form
                                 kg: Math.round(+u.weightKg || 0),
                                 gk: u.groupKind || null,
                               })),
+                              z18Debug: built.filter(u => String(u.mark || '').indexOf('200Z18') === 0)
+                                .slice(0, 3).map(u => ({
+                                  mark: u.mark,
+                                  uid: u._fmUid,
+                                  qty: u.qty,
+                                  pw: +u.packWidthMm || 0,
+                                  keepFlag: !!u._keepGroupByBundle,
+                                  freezeFlag: !!u._freezeGroupByPose,
+                                  isNestUnit: (typeof csPackIsNestUnit === 'function') ? csPackIsNestUnit(u) : null,
+                                  isLocked: (typeof csPackIsGroupByLockedNest === 'function') ? csPackIsGroupByLockedNest(u) : null,
+                                  stableBundleMm: u.stableBundleMm || null,
+                                  bundle_bbox: u.bundle_bbox || null,
+                                  srcPuKeepFlag: u._srcPackUnit ? !!u._srcPackUnit._keepGroupByBundle : null,
+                                  srcPuStable: u._srcPackUnit ? u._srcPackUnit.stableBundleMm : null,
+                                  nestingInfo: u.nestingInfo || null,
+                                })),
                             };
                           }
 
@@ -2050,10 +2066,19 @@ public class MainForm : Form
                               if (typeof csPackV2PublishPackReport === 'function' && report5)
                                 csPackV2PublishPackReport(report5, { updateDom: false });
                             } catch (_) { /* */ }
+                            // Step 4 counts the geometric pack; the report counts
+                            // what is still aboard after the payload cap unloads
+                            // the overweight tail, so the two differ by exactly
+                            // the number of capped pieces.
+                            const capped5 = +(report5 && report5.weightCappedCount) || 0;
+                            // Unloading takes the highest pieces first, so stacks
+                            // are what leave: the report can only ever report
+                            // fewer stacks than the geometric pack, never more.
                             const matchStep4 = !!(report5
-                              && step4.placedWithStacks === report5.placedCount
-                              && step4.stackCount === report5.stackCount
-                              && step4.unplacedCount === report5.unplacedCount);
+                              && step4.placedWithStacks - capped5 === report5.placedCount
+                              && report5.stackCount <= step4.stackCount
+                              && (capped5 > 0 || step4.stackCount === report5.stackCount)
+                              && step4.unplacedCount + capped5 === report5.unplacedCount);
                             const applyOk = !!(opt5 && opt5.apply
                               && opt5.apply.missed === 0
                               && opt5.placedItems

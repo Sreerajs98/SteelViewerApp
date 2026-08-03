@@ -781,8 +781,14 @@ function makeZPurlinBundle(it, color, opacity) {
       mesh.userData.nestFlip = flip;
       group.add(mesh);
     });
-    if (typeof refineInterlockNestGroup === 'function')
-      refineInterlockNestGroup(group, it);
+    // refineInterlockNestGroup only tests/pushes along a single 2D axis (u or v).
+    // Tilted nests (use_tilted_nest_axis) place pieces along a diagonal Y+Z axis,
+    // so its single-axis overlap probe sees false "still overlapping" and can
+    // push pieces far apart (bundle blows up). computeInterlockNestPlacements
+    // already did a correct collision-fit for the tilted axis — trust it here.
+    const canRefineFlat = typeof refineInterlockNestGroup === 'function'
+      && !(nestInfo && nestInfo.use_tilted_nest_axis);
+    if (canRefineFlat) refineInterlockNestGroup(group, it);
     else recenterGroupAabb(group);
     return finishStable(group);
   }

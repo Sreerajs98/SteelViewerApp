@@ -361,3 +361,11 @@ MigrationBackup/
 
 # Fody - auto-generated XML schema
 FodyWeavers.xsd
+# Local CLI / harness outputs
+report_*.json
+report_dbg.json
+devharness/out/
+devharness/shots/
+devharness/scenes/
+devharness/node_modules/
+

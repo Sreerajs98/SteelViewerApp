@@ -17,11 +17,14 @@ function csShipPrepClass(it) {
   if (gk === 'nest_l' || sk === 'l_angle') return 'nest_l';
   if (sk === 'plate' || gk === 'stack_plate' || it.category === 'plate') return 'plate';
   if (sk === 'rod' || sk === 'bent_sag_rod' || it.category === 'rod') return 'rod';
-  if (sk === 'i_beam' || sk === 'rhs' || sk === 'chs' || it.category === 'beam')
-    return 'beam';
+  // Welded assemblies before bare beam — an i_beam shapeKey on a rafter must
+  // still get assembly flatten, not the thin-beam ground path that left roof
+  // pitch in the container.
   if (it.isAssembly || gk === 'welded_assembly' || gk === 'assembly_single'
       || (it.parts && it.parts.length >= 2))
     return 'assembly';
+  if (sk === 'i_beam' || sk === 'rhs' || sk === 'chs' || it.category === 'beam')
+    return 'beam';
   if (typeof csNzIsZShape === 'function' && csNzIsZShape(it)) return 'nest_z';
   return 'other';
 }
@@ -91,7 +94,10 @@ function csShipPrepTipLevel(mesh, keepX, keepZ) {
   if (!mesh || typeof THREE === 'undefined') return { tipGapMm: 1e9 };
   const kx = keepX != null ? keepX : mesh.position.x;
   const kz = keepZ != null ? keepZ : mesh.position.z;
-  const maxTipRad = 35 * Math.PI / 180;
+  // Shipping needs full flatten. A 35° cap left pitched rafters leaning in the
+  // container (building roof angle ≈ 30–60° never cancelled). Allow a full
+  // quarter-turn per step; faceDownOk still rejects standing-on-end poses.
+  const maxTipRad = 90 * Math.PI / 180;
   const sc = (typeof SCALE === 'number' && SCALE > 0) ? SCALE : 0.01;
   const tolMm = 8;
 
@@ -154,12 +160,23 @@ function csShipPrepTipLevel(mesh, keepX, keepZ) {
   }
 
   function faceDownOk() {
-    if (typeof evaluateMeshGroupStability !== 'function') return true;
-    const ev = evaluateMeshGroupStability(mesh);
-    if (ev.standing_on_end || ev.thin_edge_sit) return false;
-    const sy = ev.size?.y || 1;
-    const sz = ev.size?.z || 1;
-    return sy <= sz * 1.22;
+    // Shipping rule: the longest span must lie roughly horizontal. A deep
+    // I-beam on its flange is valid even when height > width — the old
+    // sy <= sz*1.22 test rejected that pose and left pitched rafters leaning.
+    mesh.updateMatrixWorld(true);
+    const b = new THREE.Box3().setFromObject(mesh);
+    if (!isFinite(b.min.x)) return false;
+    const sx = b.max.x - b.min.x;
+    const sy = b.max.y - b.min.y;
+    const sz = b.max.z - b.min.z;
+    const longest = Math.max(sx, sy, sz);
+    // Standing on end = length up the container height
+    if (sy >= longest * 0.92 && sy > Math.max(sx, sz) * 1.15) return false;
+    if (typeof evaluateMeshGroupStability === 'function') {
+      const ev = evaluateMeshGroupStability(mesh);
+      if (ev && ev.standing_on_end) return false;
+    }
+    return true;
   }
 
   function applyAxis(axis, ang) {
@@ -193,7 +210,7 @@ function csShipPrepTipLevel(mesh, keepX, keepZ) {
   let bestTg = csShipPrepTipGapMm(mesh);
   let bestQ = mesh.quaternion.clone();
   let bestPy = mesh.position.y;
-  const tipDegs = [0.5, 1, 2, 3, 5, 8, 12, 18, 25];
+  const tipDegs = [0.5, 1, 2, 3, 5, 8, 12, 18, 25, 35, 45, 60];
   const axes = [new THREE.Vector3(1, 0, 0), new THREE.Vector3(0, 0, 1)];
   for (let pass = 0; pass < 2; pass++) {
     let improved = false;
@@ -221,6 +238,144 @@ function csShipPrepTipLevel(mesh, keepX, keepZ) {
   mesh.position.set(kx, bestPy, kz);
   snapG();
   return { tipGapMm: csShipPrepTipGapMm(mesh) };
+}
+
+/**
+ * Stand a deep assembly on its flange when that is the slimmer way to ship it.
+ *
+ * Laying a member max-flat puts its deepest face on the floor, so a 2 m deep
+ * girder segment lies on its web and eats the whole container width while
+ * standing barely 350 mm tall. Yards ship those on edge: web vertical, flange
+ * down. Only a clearly wasteful pose is turned, and only when the turned pose
+ * still fits inside the box, so genuinely flat pieces (plates, panels, shallow
+ * beams already resting on a flange) are left exactly as they were.
+ *
+ * @returns {boolean} true when the mesh was turned
+ */
+/**
+ * Brute-force a flat shipping seat: try pitch/roll steps and keep the pose
+ * with the smallest bottom-Y span (tip gap) that is not standing on end.
+ */
+function csShipPrepForceFlat(mesh, keepX, keepZ, tipGap0) {
+  if (!mesh || typeof THREE === 'undefined') return tipGap0 || 1e9;
+  const kx = keepX != null ? keepX : mesh.position.x;
+  const kz = keepZ != null ? keepZ : mesh.position.z;
+  const sc = (typeof SCALE === 'number' && SCALE > 0) ? SCALE : 0.01;
+
+  const nail = () => {
+    mesh.position.x = kx;
+    mesh.position.z = kz;
+    mesh.position.y = 0;
+    mesh.updateMatrixWorld(true);
+    csShipPrepNailGround(mesh);
+    mesh.position.x = kx;
+    mesh.position.z = kz;
+    mesh.updateMatrixWorld(true);
+  };
+  const tipMm = () => csShipPrepTipGapMm(mesh);
+  const standingOnEnd = () => {
+    mesh.updateMatrixWorld(true);
+    const b = new THREE.Box3().setFromObject(mesh);
+    if (!isFinite(b.min.x)) return true;
+    const sx = (b.max.x - b.min.x) / sc;
+    const sy = (b.max.y - b.min.y) / sc;
+    const sz = (b.max.z - b.min.z) / sc;
+    const longest = Math.max(sx, sy, sz);
+    return sy >= longest * 0.92 && sy > Math.max(sx, sz) * 1.15;
+  };
+
+  let bestTg = tipGap0 != null ? tipGap0 : tipMm();
+  let bestQ = mesh.quaternion.clone();
+  const baseQ = mesh.quaternion.clone();
+  const deg = [0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60];
+  for (let pi = 0; pi < deg.length; pi++) {
+    for (const ps of [1, -1]) {
+      for (let ri = 0; ri < deg.length; ri++) {
+        for (const rs of [1, -1]) {
+          if (deg[pi] === 0 && ps < 0) continue;
+          if (deg[ri] === 0 && rs < 0) continue;
+          mesh.quaternion.copy(baseQ);
+          if (deg[pi]) {
+            mesh.quaternion.premultiply(new THREE.Quaternion()
+              .setFromAxisAngle(new THREE.Vector3(0, 0, 1), ps * deg[pi] * Math.PI / 180));
+          }
+          if (deg[ri]) {
+            mesh.quaternion.premultiply(new THREE.Quaternion()
+              .setFromAxisAngle(new THREE.Vector3(1, 0, 0), rs * deg[ri] * Math.PI / 180));
+          }
+          mesh.rotation.setFromQuaternion(mesh.quaternion);
+          nail();
+          if (standingOnEnd()) continue;
+          const tg = tipMm();
+          if (tg < bestTg - 0.5) {
+            bestTg = tg;
+            bestQ = mesh.quaternion.clone();
+            if (bestTg <= 8) {
+              mesh.quaternion.copy(bestQ);
+              mesh.rotation.setFromQuaternion(bestQ);
+              nail();
+              return bestTg;
+            }
+          }
+        }
+      }
+    }
+  }
+  mesh.quaternion.copy(bestQ);
+  mesh.rotation.setFromQuaternion(bestQ);
+  nail();
+  return bestTg;
+}
+
+function csShipPrepStandOnEdge(mesh, it) {
+  if (!mesh || !it || typeof THREE === 'undefined') return false;
+  const isAsm = !!(it.isAssembly
+    || it.groupKind === 'welded_assembly'
+    || it.groupKind === 'assembly_single');
+  if (!isAsm) return false;
+  const sc = (typeof SCALE === 'number' && SCALE > 0) ? SCALE : 0.01;
+
+  let Wcap = 2438;
+  let Hcap = 2690;
+  try {
+    if (typeof rawScene !== 'undefined' && rawScene && rawScene.containerSpec) {
+      if (+rawScene.containerSpec.widthMm > 500) Wcap = +rawScene.containerSpec.widthMm;
+      if (+rawScene.containerSpec.heightMm > 500) Hcap = +rawScene.containerSpec.heightMm;
+    }
+  } catch (_) { /* */ }
+
+  const measure = () => {
+    mesh.updateMatrixWorld(true);
+    const b = new THREE.Box3().setFromObject(mesh);
+    if (!isFinite(b.min.x)) return null;
+    return { w: (b.max.z - b.min.z) / sc, h: (b.max.y - b.min.y) / sc };
+  };
+  const flat = measure();
+  if (!flat) return false;
+
+  const keepQ = mesh.quaternion.clone();
+  const keepY = mesh.position.y;
+  mesh.quaternion.premultiply(new THREE.Quaternion()
+    .setFromAxisAngle(new THREE.Vector3(1, 0, 0), Math.PI / 2));
+  mesh.rotation.setFromQuaternion(mesh.quaternion);
+  csShipPrepNailGround(mesh);
+  const edge = measure();
+
+  // Horizontal shipping is the default. Only stand a piece on edge when the
+  // flat pose cannot enter the box at all — never just because edge is narrower.
+  // Standing deep girders upright for "space" is what put vertical towers in
+  // the container while the operator expected every piece to lie flat.
+  const flatFits = flat.w <= Wcap + 1 && flat.h <= Hcap + 1;
+  const edgeFits = !!edge && edge.w <= Wcap + 1 && edge.h <= Hcap + 1;
+  if (flatFits || !edgeFits) {
+    mesh.quaternion.copy(keepQ);
+    mesh.rotation.setFromQuaternion(keepQ);
+    mesh.position.y = keepY;
+    mesh.updateMatrixWorld(true);
+    return false;
+  }
+  it._shipStoodOnEdge = true;
+  return true;
 }
 
 /** Stamp ship-prep fields onto item from live mesh. */
@@ -345,6 +500,50 @@ function csShipPrepStamp(it, mesh, cls, tipGapMm) {
             sb.tipGapMm = it.tipGapMm;
           } catch (_) { /* */ }
         }
+        // Keep the construct seat only if the posed mesh really occupies it.
+        // Reserving a footprint the geometry cannot hold is what pushes pieces
+        // through the container wall once they are drawn.
+        let seated = null;
+        try {
+          mesh.updateMatrixWorld(true);
+          const sBox = new THREE.Box3().setFromObject(mesh);
+          if (isFinite(sBox.min.x)) {
+            seated = {
+              l: (sBox.max.x - sBox.min.x) / sc,
+              h: (sBox.max.y - sBox.min.y) / sc,
+              w: (sBox.max.z - sBox.min.z) / sc,
+            };
+          }
+        } catch (_) { /* */ }
+        const seatTol = Math.max(60, Math.min(sb.w, sb.h) * 0.15);
+        const seatOk = !!seated
+          && Math.abs(seated.w - sb.w) <= seatTol
+          && Math.abs(seated.h - sb.h) <= seatTol
+          && Math.abs(seated.l - sb.l) <= Math.max(150, sb.l * 0.05);
+        const seatFits = !!seated && seated.w <= 2438 + 1 && seated.h <= 2690 + 1;
+        if (seatFits) {
+          // The posed mesh is what actually occupies space, whether or not it
+          // landed on the construct seat. Reserve the measured envelope so the
+          // packer can never seat neighbours inside a piece it under-measured.
+          sb = {
+            l: seated.l, w: seated.w, h: seated.h,
+            source: 'ship_prep',
+            tipGapMm: it.tipGapMm,
+            pitchedFrom: sb.pitchedFrom,
+            constructSeat: seatOk,
+            constructSeatRejected: !seatOk,
+          };
+        } else {
+          const back = sb.pitchedFrom || {};
+          sb = {
+            l: +back.l > 0 ? back.l : (seated ? seated.l : sb.l),
+            w: +back.w > 0 ? back.w : (seated ? seated.w : sb.w),
+            h: +back.h > 0 ? back.h : (seated ? seated.h : sb.h),
+            source: 'ship_prep',
+            tipGapMm: it.tipGapMm,
+            constructSeatRejected: true,
+          };
+        }
       }
     }
     it.stableBundleMm = sb;
@@ -376,7 +575,14 @@ function csShipPrepMesh(mesh, it) {
   if (cls === 'nest_z') {
     // Legacy Z nest / Rule1 — never PCA flatten
     method = 'nest_z_keep';
-    if (typeof ensureStableShape === 'function' && !it._keepGroupByBundle) {
+    // Apply Group By frozen orientation first (prevents IFC world fan spread)
+    if (it._groupByQuat && typeof applyGroupByFrozenQuat === 'function') {
+      applyGroupByFrozenQuat(mesh, it);
+      mesh.position.x = keepX;
+      mesh.position.z = keepZ;
+      mesh.updateMatrixWorld && mesh.updateMatrixWorld(true);
+      method = 'nest_z_groupby';
+    } else if (typeof ensureStableShape === 'function' && !it._keepGroupByBundle) {
       // makeShape already built nest; just nail
     }
     csShipPrepNailGround(mesh);
@@ -389,11 +595,24 @@ function csShipPrepMesh(mesh, it) {
     method = 'assembly_ship_prep';
     it._yardStraighten = true;
     it.assemblyShipPose = true;
+    // Drop any yard / building pitch that was frozen onto the item — Optimise
+    // must measure and draw a flat shipping pose, not the roof angle.
+    try {
+      delete it._groupByQuat;
+      delete mesh.userData._groupByQuat;
+      it._freezeGroupByPose = false;
+    } catch (_) { /* */ }
     if (typeof straightenYardItemOnGround === 'function') {
       straightenYardItemOnGround(mesh, it);
     }
     const tip = csShipPrepTipLevel(mesh, keepX, keepZ);
     tipGapMm = tip.tipGapMm;
+    // Tip-level alone can leave a long rafter with 100–300 mm end lift. Brute
+    // search a flat seat by minimising bottom-Y span along the length.
+    if (tipGapMm > 25) {
+      tipGapMm = csShipPrepForceFlat(mesh, keepX, keepZ, tipGapMm);
+      method = 'assembly_ship_prep_force_flat';
+    }
     csShipPrepNailGround(mesh);
     // If max-flat AABB still exceeds 40ft W, try refineAssemblyGroundPose once
     // (may pick construct / mid-height seat that fits without inventing dims).
@@ -416,6 +635,13 @@ function csShipPrepMesh(mesh, it) {
         } catch (_) { /* */ }
       }
     }
+    if (csShipPrepStandOnEdge(mesh, it)) {
+      mesh.position.x = keepX;
+      mesh.position.z = keepZ;
+      csShipPrepNailGround(mesh);
+      tipGapMm = csShipPrepTipGapMm(mesh);
+      method = 'assembly_ship_prep_on_edge';
+    }
     csShipPrepStamp(it, mesh, cls, tipGapMm);
     return { ok: true, class: cls, tipGapMm, method };
   }
@@ -423,6 +649,14 @@ function csShipPrepMesh(mesh, it) {
   if (cls === 'nest_c' || cls === 'nest_l') {
     method = 'nest_ground';
     it._keepGroupByBundle = true;
+    // Apply Group By frozen orientation first (prevents IFC world fan spread)
+    if (it._groupByQuat && typeof applyGroupByFrozenQuat === 'function') {
+      applyGroupByFrozenQuat(mesh, it);
+      mesh.position.x = keepX;
+      mesh.position.z = keepZ;
+      mesh.updateMatrixWorld && mesh.updateMatrixWorld(true);
+      method = 'nest_cl_groupby';
+    }
     csShipPrepNailGround(mesh);
     tipGapMm = csShipPrepTipGapMm(mesh);
     csShipPrepStamp(it, mesh, cls, tipGapMm);
@@ -437,7 +671,22 @@ function csShipPrepMesh(mesh, it) {
   } else if (typeof groundOrientItem === 'function') {
     groundOrientItem(it, mesh);
   }
+  {
+    const tip0 = csShipPrepTipLevel(mesh, keepX, keepZ);
+    tipGapMm = tip0.tipGapMm;
+    if (tipGapMm > 25) {
+      tipGapMm = csShipPrepForceFlat(mesh, keepX, keepZ, tipGapMm);
+      method = 'flat_ground_force_flat';
+    }
+  }
   csShipPrepNailGround(mesh);
+  // Deep assemblies land here too when their section reads as a plain beam.
+  if (csShipPrepStandOnEdge(mesh, it)) {
+    mesh.position.x = keepX;
+    mesh.position.z = keepZ;
+    csShipPrepNailGround(mesh);
+    method = 'flat_ground_on_edge';
+  }
   tipGapMm = csShipPrepTipGapMm(mesh);
   csShipPrepStamp(it, mesh, cls, tipGapMm);
   return { ok: true, class: cls, tipGapMm, method };
@@ -453,6 +702,7 @@ function csShipPrepItem(it) {
   const sb0 = it.stableBundleMm;
   const staleSeat = !!(sb0 && /ship_prep/i.test(String(sb0.source || ''))
     && (+sb0.w > 2438 + 1 || +sb0.h > 2690 + 1
+      || +it.tipGapMm > 40
       || (it.sectH > 0 && Math.abs(+sb0.h - +it.sectH) < 1.5 && +sb0.h < 900)));
   if (it._shipPrepped && it._groupByQuat && sb0 && !staleSeat
       && /ship_prep|yard_straighten/i.test(String(sb0.source || ''))) {
@@ -469,12 +719,23 @@ function csShipPrepItem(it) {
   let mesh = null;
   try {
     const cls = csShipPrepClass(it);
+    // Record the exact inputs this measurement was taken with. The renderer has
+    // to rebuild from these same numbers, or it measures one shape and draws
+    // another — see csShipPrepPosedMesh.
+    const dims = {
+      l: it.lengthMm || it.l || 500,
+      w: it.widthMm || it.w || 200,
+      h: it.heightMm || it.h || 200,
+      qty: it.qty || 1,
+      cls,
+    };
+    it._shipPrepDimsMm = dims;
     mesh = makeShape({
       ...it,
-      lengthMm: it.lengthMm || it.l || 500,
-      widthMm: it.widthMm || it.w || 200,
-      heightMm: it.heightMm || it.h || 200,
-      qty: it.qty || 1,
+      lengthMm: dims.l,
+      widthMm: dims.w,
+      heightMm: dims.h,
+      qty: dims.qty,
       _yardStraighten: cls !== 'nest_z',
       _keepGroupByBundle: cls === 'nest_z' || cls === 'nest_c' || cls === 'nest_l',
       assemblyShipPose: cls === 'assembly',
@@ -492,6 +753,46 @@ function csShipPrepItem(it) {
         mesh.traverse(o => { if (o.geometry) o.geometry.dispose(); });
       } catch (_) { /* */ }
     }
+  }
+}
+
+/**
+ * Build a display mesh in the exact pose Ship Prep measured this unit in.
+ *
+ * Optimise reserves packFootprint* / stableBundleMm from the mesh this pipeline
+ * produces, so the renderer has to come back through the same pipeline. A
+ * stored quaternion is not enough: ship prep settles part of the pose into
+ * child transforms, so replaying only the root rotation onto a mesh rebuilt
+ * with different makeShape inputs lands the piece somewhere else — which is how
+ * a 200 mm wide rafter ended up 2.5 m wide and through the container wall.
+ *
+ * The unit's own packing stamps are left untouched; posing runs on a copy.
+ */
+function csShipPrepPosedMesh(it, color, opacity) {
+  if (!it || typeof makeShape !== 'function' || typeof THREE === 'undefined') return null;
+  try {
+    // Replay the dims the measurement was taken with when we have them; the
+    // render path substitutes section / original-IFC dims that would build a
+    // different shape from the one Optimise reserved space for.
+    const rec = it._shipPrepDimsMm || null;
+    const cls = (rec && rec.cls) || csShipPrepClass(it);
+    const mesh = makeShape({
+      ...it,
+      lengthMm: (rec && rec.l) || it.lengthMm || it.l || 500,
+      widthMm: (rec && rec.w) || it.widthMm || it.w || 200,
+      heightMm: (rec && rec.h) || it.heightMm || it.h || 200,
+      qty: (rec && rec.qty) || it.qty || 1,
+      _yardStraighten: cls !== 'nest_z',
+      _keepGroupByBundle: cls === 'nest_z' || cls === 'nest_c' || cls === 'nest_l',
+      assemblyShipPose: cls === 'assembly',
+      _skipStability: false,
+    }, color, opacity);
+    if (!mesh) return null;
+    csShipPrepMesh(mesh, { ...it });
+    return mesh;
+  } catch (e) {
+    try { console.warn('[ship-prep pose]', it.mark, e); } catch (_) { /* */ }
+    return null;
   }
 }
 

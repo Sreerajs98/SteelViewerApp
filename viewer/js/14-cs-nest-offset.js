@@ -520,6 +520,18 @@ function computeInterlockNestPlacements(cs, count, nestDir2d, clearanceMm, allow
       slide = prevSlide + Math.max(rel, CSOFF_FIT_STEP_MM);
     }
 
+    // Sanity cap: the grid-based overlap test (10-cs-analyze.js CSA_GRID_N)
+    // is too coarse for thin webs/flanges on some profiles, which can let the
+    // 0.1mm walk (or its csaMinSeparation fallback) run out to `maxExtra`
+    // instead of the true contact point — producing a per-piece step many
+    // times larger than physically real (measured real-world nests step by
+    // roughly a few multiples of clearance, not a fraction of the whole
+    // cross-section span). Clamp the raw geometric step before adding
+    // clearance so one bad collision read can't blow up the whole bundle.
+    const stepCapMm = Math.max(clear * 4, Math.min(span * 0.1, 30));
+    const rawStep = slide - prevSlide;
+    if (rawStep > stepCapMm) slide = prevSlide + stepCapMm;
+
     // Clearance beyond first non-overlap contact
     slide += clear;
 
@@ -788,10 +800,21 @@ function csoffInterlockSlide(cs, an, wantFlip, nestDir2d, dims) {
 
   candidates.sort((a, b) => b.score - a.score || a.distance - b.distance);
   const best = candidates[0] || { distance: dims.t, used_flip: wantFlip };
-  // Guard: offset must be positive and less than full span (else not really nesting)
+  // Guard: offset must be positive and physically plausible for a tight
+  // interlock nest. csaMinSeparation's occupancy grid (CSA_GRID_N in
+  // 10-cs-analyze.js) is coarse relative to thin walls/flanges (a few mm)
+  // sitting inside a much larger cross-section bbox (tens to hundreds of mm).
+  // On some profiles this makes the binary search converge on a spuriously
+  // large "separation" — many times the real interlock step — instead of
+  // the true thin-wall contact point. A true interlock gap for sheet steel
+  // scales with material thickness, not with the whole cross-section span,
+  // so reject anything far outside that physical range and fall back to a
+  // thickness-based estimate (matches ship-prep measured nests: ~6-8x t).
   let d = best.distance;
-  if (!(d > 0) || !isFinite(d)) d = Math.max(dims.t, 1);
-  if (d > Math.max(bb.w, bb.h) * 1.2) d = Math.max(dims.t, 1);
+  const plausibleMax = Math.max(dims.t * 15, 20);
+  if (!(d > 0) || !isFinite(d) || d > plausibleMax || d > Math.max(bb.w, bb.h) * 1.2) {
+    d = Math.max(dims.t * 6, 1);
+  }
   return { distance: d, used_flip: !!best.used_flip, source: 'polygon_slide' };
 }
 

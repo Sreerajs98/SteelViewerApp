@@ -295,78 +295,82 @@ function renderContainer(idx) {
             _skipStability: true,
             _freezeGroupByPose: true,
             assemblyShipPose: true,
+            // Rebuild through ship prep so the drawn pose is the one Optimise
+            // reserved space for, instead of replaying a stored quaternion.
+            _useShipPrepPose: true,
           };
         }
       }
     }
 
-    // Twin rafters: real IFC mesh, forced upright to pack footprint (L×H×W).
-    // Proxy box only if align cannot reach steel W×H (pitched IFC leftover).
+    // Bundles Group By built in the yard — plate stacks, rod and bent-rod
+    // bundles. Optimise reserves the whole bundle, so the container has to draw
+    // that same bundle. Rebuilding from the packed dims yields one loose piece
+    // lying in a slot sized for the bundle it was cut from.
+    const gkRender = String(it.groupKind || '').toLowerCase();
+    if (!shapeIt._useShipPrepPose
+        && (gkRender === 'stack_plate' || /^bundle_/.test(gkRender))) {
+      shapeIt = { ...shapeIt, _useShipPrepPose: true };
+    }
+
+    // Twin rafters must use the SAME real IFC geometry and Group By pose as
+    // the staging view. Pack V2 supplies only the seat; it must not remesh,
+    // footprint-align, or replace the rafter with a proxy box.
     let box;
     const pairLane = !!(it._pairLaneLock || it._pairPreferIfcMesh
       || /rafter_pair/i.test(String(it.packOrientTag || '')));
-    if (pairLane && typeof THREE !== 'undefined') {
-      const L = Math.max(+it.packFootprintL || +it.l || +it.lengthMm || 1000, 100);
-      const H = Math.max(
-        +(it.stableBundleMm && it.stableBundleMm.h)
-        || +it.packFootprintH || +it.h || +it.heightMm || 500, 50);
-      const W = Math.max(+it._pairVisW
-        || (it.stableBundleMm && +it.stableBundleMm.w)
-        || 200, 80);
-      // Build real IFC assembly (skip nest-keep reshape that zeros parts)
-      const ifcIt = {
-        ...it,
-        _keepGroupByBundle: false,
-        _skipStability: true,
-        _yardStraighten: true,
-        assemblyShipPose: true,
-        packYawOnly: true,
-        packFootprintL: L,
-        packFootprintW: W,
-        packFootprintH: H,
-        qty: 1,
-      };
-      box = makeShape(ifcIt, color);
-      // Ship-prep upright, then ALWAYS align to packer L×H×W (steel seat)
-      if (typeof csShipPrepMesh === 'function') {
-        try { csShipPrepMesh(box, ifcIt); }
-        catch (_) { /* */ }
-      }
-      {
-        const prevL = it.packFootprintL, prevW = it.packFootprintW, prevH = it.packFootprintH;
-        it.packFootprintL = L; it.packFootprintW = W; it.packFootprintH = H;
-        if (typeof alignMeshToPackFootprint === 'function')
-          alignMeshToPackFootprint(box, it);
-        it.packFootprintL = prevL; it.packFootprintW = prevW; it.packFootprintH = prevH;
-      }
-      const yaw = (it.userRot && it.userRot.y) || 0;
-      if (Math.abs(yaw) > 1e-9) {
-        box.quaternion.premultiply(
-          new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), yaw));
-        box.rotation.setFromQuaternion(box.quaternion);
-      }
-      box.updateMatrixWorld(true);
-      let bb0 = new THREE.Box3().setFromObject(box);
-      const sc0 = SCALE;
-      let meshW0 = (bb0.max.z - bb0.min.z) / sc0;
-      let meshH0 = (bb0.max.y - bb0.min.y) / sc0;
-      // Stiffeners / end plates can fatten W; keep IFC if web height is upright
-      const uprightOk = meshH0 >= H * 0.55 && meshH0 <= H * 1.65
-        && meshW0 <= Math.max(W * 3.8, 720) && meshW0 < meshH0 * 1.15;
-      if (!uprightOk && typeof makeBox === 'function') {
-        box = makeBox(L, H, W, color, 0.92);
+
+    // Assemblies: rebuild through ship prep so the drawn envelope equals the
+    // reserved one, then add only the packer's plan yaw. Re-applying the frozen
+    // quat here would throw the piece back into its pre-ship-prep pose.
+    if (shapeIt._useShipPrepPose && typeof csShipPrepPosedMesh === 'function'
+        && typeof THREE !== 'undefined') {
+      box = csShipPrepPosedMesh(shapeIt, color, 1);
+      if (box) {
+        const tagRot = (typeof packOrientTagToRot === 'function')
+          ? packOrientTagToRot(it) : null;
+        const yaw = (it.userRot && it.userRot.y) || (tagRot && tagRot.y) || 0;
         if (Math.abs(yaw) > 1e-9) {
-          box.quaternion.setFromAxisAngle(new THREE.Vector3(0, 1, 0), yaw);
+          box.quaternion.premultiply(new THREE.Quaternion()
+            .setFromAxisAngle(new THREE.Vector3(0, 1, 0), yaw));
           box.rotation.setFromQuaternion(box.quaternion);
+          box.updateMatrixWorld(true);
         }
-        it._pairUsedBoxProxy = true;
-      } else {
-        it._pairUsedBoxProxy = false;
+        // The packer may seat a piece cross-wise, and that choice shows up only
+        // as a swapped L/W in the reserved footprint. Turn the mesh to match,
+        // otherwise it is drawn lying down the container while its slot runs
+        // across it, and it overhangs the side wall.
+        const fl = +it.packFootprintL || 0;
+        const fw = +it.packFootprintW || 0;
+        if (fl > 0 && fw > 0) {
+          const sc = (typeof SCALE === 'number' && SCALE > 0) ? SCALE : 0.01;
+          box.updateMatrixWorld(true);
+          const fb = new THREE.Box3().setFromObject(box);
+          const ml = (fb.max.x - fb.min.x) / sc;
+          const mw = (fb.max.z - fb.min.z) / sc;
+          const asIs = Math.abs(ml - fl) + Math.abs(mw - fw);
+          const turned = Math.abs(ml - fw) + Math.abs(mw - fl);
+          if (turned + 1 < asIs) {
+            box.quaternion.premultiply(new THREE.Quaternion()
+              .setFromAxisAngle(new THREE.Vector3(0, 1, 0), Math.PI / 2));
+            box.rotation.setFromQuaternion(box.quaternion);
+            box.updateMatrixWorld(true);
+          }
+        }
+        it._orientLocked = true;
+        it._lockedQuaternion = box.quaternion.clone();
+        it._shipPosedRender = true;
       }
+    }
+
+    if (box) { /* ship-prep pose already seated */ } else if (pairLane && typeof THREE !== 'undefined') {
+      box = makeShape(shapeIt, color);
+      if (typeof applyGroupByFrozenQuat === 'function')
+        applyGroupByFrozenQuat(box, it);
+      applyPackItemRotation(box, shapeIt);
       it._orientLocked = true;
       it._lockedQuaternion = box.quaternion.clone();
-      it._keepGroupByBundle = false;
-      it._pairVisW = W;
+      it._pairUsedBoxProxy = false;
     } else {
       box = makeShape(shapeIt, color);
       if (typeof applyGroupByFrozenQuat === 'function')
@@ -2426,10 +2430,14 @@ function alignMeshToPackFootprint(mesh, it) {
   if (!(tL > 0 && tW > 0 && tH > 0)) return false;
   const target = [tL, tH, tW]; // world X,Y,Z mm
   const tol = Math.max(80, Math.min(tL, tW, tH) * 0.08);
-  const wantFlat = typeof packItemNeedsFlatAlign === 'function'
+  // A target far taller than it is wide describes a member shipped standing on
+  // edge — a deep rafter or girder on its flange. That reading comes from the
+  // IFC construct axes, so it outranks the generic "lay it flat" preference;
+  // obeying flat here is what turned 200 mm wide rafters into 2.5 m wide ones.
+  const wantUpright = tH > tW * 2.2 && tH > 800;
+  const wantFlat = !wantUpright
+    && typeof packItemNeedsFlatAlign === 'function'
     && packItemNeedsFlatAlign(it);
-  // Twin / ship-prep rafters: tall thin footprint — punish pitched-flat hard
-  const wantUpright = !wantFlat && tH > tW * 2.2 && tH > 800;
 
   const measure = () => {
     mesh.updateMatrixWorld(true);
@@ -2470,6 +2478,12 @@ function alignMeshToPackFootprint(mesh, it) {
   const trials = [
     { x: ur.x || 0, y: ur.y || 0, z: ur.z || 0 },
     { x: 0, y: 0, z: 0 },
+    // Pure yaw: swings a member's length between the Z and X axes. IFC hands
+    // rafters/columns in with the span on Z, so this is the turn that seats a
+    // long member down the container without touching its pitch.
+    { x: 0, y: Math.PI / 2, z: 0 },
+    { x: 0, y: -Math.PI / 2, z: 0 },
+    { x: 0, y: Math.PI, z: 0 },
     { x: Math.PI / 2, y: 0, z: 0 },
     { x: -Math.PI / 2, y: 0, z: 0 },
     { x: Math.PI, y: 0, z: 0 },
@@ -2503,18 +2517,25 @@ function alignMeshToPackFootprint(mesh, it) {
       trials.push({ x: (ur.x || 0) + r, y: ur.y || 0, z: ur.z || 0 });
     });
   }
-  for (let i = 0; i < trials.length; i++) {
-    const t = trials[i];
-    mesh.quaternion.copy(qRest);
-    const e = new THREE.Euler(t.x, t.y, t.z, 'XYZ');
-    mesh.quaternion.premultiply(new THREE.Quaternion().setFromEuler(e));
-    mesh.rotation.setFromQuaternion(mesh.quaternion);
-    const d = measure();
-    const err = errOf(d);
-    if (err < best.err - 1e-6 || (Math.abs(err - best.err) <= 1e-6 && d[1] < best.h)) {
-      best = { err, q: mesh.quaternion.clone(), h: d[1] };
+  // Search from two bases. The mesh may arrive already tilted (ship prep lays
+  // pitched members flat); once a tilt is baked in, no axis-aligned turn can
+  // reach an axis-aligned target envelope, so the rest pose must be tried too.
+  const bases = [qRest, new THREE.Quaternion()];
+  let hit = false;
+  for (let b = 0; b < bases.length && !hit; b++) {
+    for (let i = 0; i < trials.length; i++) {
+      const t = trials[i];
+      mesh.quaternion.copy(bases[b]);
+      const e = new THREE.Euler(t.x, t.y, t.z, 'XYZ');
+      mesh.quaternion.premultiply(new THREE.Quaternion().setFromEuler(e));
+      mesh.rotation.setFromQuaternion(mesh.quaternion);
+      const d = measure();
+      const err = errOf(d);
+      if (err < best.err - 1e-6 || (Math.abs(err - best.err) <= 1e-6 && d[1] < best.h)) {
+        best = { err, q: mesh.quaternion.clone(), h: d[1] };
+      }
+      if (err <= tol && (!wantFlat || d[1] <= target[1] * 1.3)) { hit = true; break; }
     }
-    if (err <= tol && (!wantFlat || d[1] <= target[1] * 1.3)) break;
   }
   mesh.quaternion.copy(best.q);
   mesh.rotation.setFromQuaternion(mesh.quaternion);
@@ -3805,7 +3826,9 @@ function runOptimizeKeepingLeftovers() {
     }
   } catch (_) { /* */ }
 
-  // Freeze Group By orientations from the current yard view
+  // Freeze Group By orientations from the current yard view for nests only.
+  // Assemblies must NOT inherit the building roof pitch — Optimise re-preps
+  // them flat for shipping.
   try {
     if (typeof captureVisibleRotations === 'function')
       captureVisibleRotations();
@@ -3814,8 +3837,17 @@ function runOptimizeKeepingLeftovers() {
     if (typeof clickable !== 'undefined' && clickable
         && typeof stampGroupByQuatOnStaging === 'function') {
       clickable.forEach(c => {
-        if (c && c.mesh && c.item)
-          stampGroupByQuatOnStaging(c.item, c.mesh);
+        if (!c || !c.mesh || !c.item) return;
+        const gk = String(c.item.groupKind || '').toLowerCase();
+        if (gk === 'welded_assembly' || gk === 'assembly_single' || c.item.isAssembly) {
+          try {
+            delete c.item._groupByQuat;
+            c.item._freezeGroupByPose = false;
+            c.item._shipPrepped = false;
+          } catch (_) { /* */ }
+          return;
+        }
+        stampGroupByQuatOnStaging(c.item, c.mesh);
       });
     }
   } catch (_) { /* */ }
