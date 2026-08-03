@@ -1,6 +1,7 @@
 /* 18-cs-pack-v2.js — Container Optimise v2 (built inch-by-inch)
  *
  * DONE:
+ *   Phase 0 — normalizeUnit(): GroupBy → immutable packer seed (data only)
  *   Step 1 — Normalize pack footprints (nest repair / assembly stamp)
  *   Step 2a — Build packer unit list (_fmUid + pack LWH) — no placement yet
  *   Step 2b — Safe floor envelope = one free-rect (no placement yet)
@@ -96,6 +97,183 @@ function csPackIsNestUnit(u) {
     if (/^nest_[zcl]$/.test(gk)) return true;
     return sk === 'z_channel' || sk === 'z_shape'
         || sk === 'c_channel' || sk === 'l_angle';
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PHASE 0 — normalizeUnit (data only — no rotation / gravity / physics)
+// Forklift input seed from GroupBy/Staging. Deterministic pure JS.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Phase 0: standardize one GroupBy/Staging packUnit for the packer.
+ * Does NOT mutate the input. Does NOT compute rotation or gravity.
+ *
+ * @param {object} packUnit
+ * @returns {object|null} frozen packer unit, or null if input missing
+ */
+function normalizeUnit(packUnit) {
+    if (!packUnit || typeof packUnit !== 'object') return null;
+
+    // (a) Preserve _groupByQuat exactly — copy values only, never remorph
+    let groupByQuat = undefined;
+    if (packUnit._groupByQuat && typeof packUnit._groupByQuat === 'object') {
+        groupByQuat = Object.freeze({
+            x: +packUnit._groupByQuat.x || 0,
+            y: +packUnit._groupByQuat.y || 0,
+            z: +packUnit._groupByQuat.z || 0,
+            w: (packUnit._groupByQuat.w != null) ? +packUnit._groupByQuat.w : 1,
+        });
+    }
+
+    // (b) Initial dims from stableBundleMm (fallback: pack* / length fields)
+    const sb = packUnit.stableBundleMm || packUnit.bundle_bbox || null;
+    let packLengthMm = 1;
+    let packWidthMm = 1;
+    let packHeightMm = 1;
+    if (sb && +sb.l > 0 && +sb.w > 0 && +sb.h > 0) {
+        packLengthMm = +sb.l;
+        packWidthMm = +sb.w;
+        packHeightMm = +sb.h;
+    } else {
+        packLengthMm = Math.max(
+            +packUnit.packLengthMm || 0,
+            +packUnit.packFootprintL || 0,
+            +packUnit.lengthMm || 0,
+            +packUnit.lengthMaxMm || 0,
+            (sb && +sb.l) || 0,
+            1);
+        packWidthMm = Math.max(
+            +packUnit.packWidthMm || 0,
+            +packUnit.packFootprintW || 0,
+            +packUnit.widthMm || 0,
+            (sb && +sb.w) || 0,
+            1);
+        packHeightMm = Math.max(
+            +packUnit.packHeightMm || 0,
+            +packUnit.packFootprintH || 0,
+            +packUnit.heightMm || 0,
+            (sb && +sb.h) || 0,
+            1);
+    }
+
+    // (c) Nest repair — Z/C/L only; fix pitched / inflated plan width
+    let nestRepaired = false;
+    const isNest = csPackIsNestUnit(packUnit);
+    if (isNest) {
+        const sectionWidth = Math.max(
+            +packUnit.sectW || 0,
+            +packUnit.unitWidth || 0,
+            (packUnit.nestPieces && packUnit.nestPieces[0]
+                && +packUnit.nestPieces[0].sectW) || 0,
+            0);
+        const quantity = Math.max(
+            1,
+            +packUnit.qty || 0,
+            (packUnit.nestPieces && packUnit.nestPieces.length) || 0,
+            (packUnit.items && packUnit.items.length) || 0);
+        const nestingOffset = Math.max(
+            0,
+            +packUnit.nestingOffsetMm || 0,
+            +packUnit.nesting_offset || 0,
+            (packUnit.nestingInfo && +packUnit.nestingInfo.nesting_offset) || 0);
+        if (sectionWidth > 0) {
+            const bundledW = (sectionWidth * quantity)
+                + (nestingOffset * Math.max(0, quantity - 1));
+            // "Pitched" = plan width far above raw bundle / section scale
+            const pitched = packWidthMm > bundledW * 1.15 + CSPACK_V2_EPS
+                || (quantity >= 2 && packWidthMm > sectionWidth * 2.5 + CSPACK_V2_EPS);
+            if (pitched && bundledW > 0) {
+                packWidthMm = bundledW;
+                nestRepaired = true;
+            }
+        }
+    }
+
+    // (d) Foreman Unique ID
+    const markSafe = String(packUnit.mark || packUnit.id || 'u')
+        .replace(/[^\w.\-]+/g, '_')
+        .slice(0, 48);
+    const fmUid = (packUnit._fmUid != null && String(packUnit._fmUid))
+        ? String(packUnit._fmUid)
+        : ('p0_' + markSafe + '_'
+            + Math.round(packLengthMm) + 'x' + Math.round(packWidthMm));
+
+    const stableOut = Object.freeze({
+        l: packLengthMm,
+        w: packWidthMm,
+        h: packHeightMm,
+        source: nestRepaired
+            ? 'nest_repair'
+            : ((sb && sb.source) ? String(sb.source) : 'phase0'),
+        tipGapMm: (sb && sb.tipGapMm != null) ? +sb.tipGapMm
+            : (packUnit.tipGapMm != null ? +packUnit.tipGapMm : undefined),
+    });
+
+    // Shallow copy metadata; packer dims + freeze flags are authoritative
+    const out = {
+        mark: packUnit.mark || null,
+        marks: Array.isArray(packUnit.marks) ? packUnit.marks.slice() : undefined,
+        groupKind: packUnit.groupKind || null,
+        shapeKey: packUnit.shapeKey || packUnit.profileShape || null,
+        profileShape: packUnit.profileShape || null,
+        isAssembly: !!packUnit.isAssembly,
+        qty: packUnit.qty,
+        sectW: packUnit.sectW,
+        sectH: packUnit.sectH,
+        unitWidth: packUnit.unitWidth,
+        unitHeight: packUnit.unitHeight,
+        nestingOffsetMm: packUnit.nestingOffsetMm != null
+            ? packUnit.nestingOffsetMm
+            : packUnit.nesting_offset,
+        nestingInfo: packUnit.nestingInfo || null,
+        nestPieces: packUnit.nestPieces,
+        items: packUnit.items,
+        memberItems: packUnit.memberItems,
+        parts: packUnit.parts,
+        weightKg: packUnit.weightKg,
+        total_weight: packUnit.total_weight,
+        shippingLengthMm: packUnit.shippingLengthMm,
+        shippingWidthMm: packUnit.shippingWidthMm,
+        shippingHeightMm: packUnit.shippingHeightMm,
+        flangeWidthMm: packUnit.flangeWidthMm,
+        _checkOrder: packUnit._checkOrder,
+        _keepGroupByBundle: packUnit._keepGroupByBundle,
+        tipGapMm: packUnit.tipGapMm,
+        // (a) quat frozen as provided
+        _groupByQuat: groupByQuat !== undefined ? groupByQuat : packUnit._groupByQuat,
+        // (b)+(c) dims
+        stableBundleMm: stableOut,
+        packLengthMm: packLengthMm,
+        packWidthMm: packWidthMm,
+        packHeightMm: packHeightMm,
+        packFootprintL: packLengthMm,
+        packFootprintW: packWidthMm,
+        packFootprintH: packHeightMm,
+        lengthMm: packLengthMm,
+        widthMm: packWidthMm,
+        heightMm: packHeightMm,
+        l: packLengthMm,
+        w: packWidthMm,
+        h: packHeightMm,
+        // (d)
+        _fmUid: fmUid,
+        // (e)
+        isFrozen: true,
+        isShipPrepped: true,
+        _freezeGroupByPose: true,
+        _shipPrepped: true,
+        _pack25dFreezePose: true,
+        _phase0Normalized: true,
+        _nestRepaired: nestRepaired,
+        phase0: true,
+    };
+
+    return Object.freeze(out);
+}
+
+/** Alias for packer call sites / console. */
+function csPackV2NormalizeUnit(packUnit) {
+    return normalizeUnit(packUnit);
 }
 
 /**
@@ -692,18 +870,33 @@ function csPackV2BuildUnits(groups, opts) {
         pus.forEach((pu) => {
             if (!pu) return;
 
-            // Clone metadata only — do not mutate the Group By pack unit object
-            const u = { ...pu };
-            if (pu.marks) u.marks = pu.marks.slice();
-            if (pu.stableBundleMm) u.stableBundleMm = { ...pu.stableBundleMm };
-            if (pu.bundle_bbox) u.bundle_bbox = { ...pu.bundle_bbox };
+            // Phase 0 — immutable seed (data only). Working copy for Step 1+.
+            const seed = {
+                ...pu,
+                groupKind: pu.groupKind || g.groupKind || null,
+                shapeKey: pu.shapeKey || g.shapeKey || g.profileShape
+                    || pu.profileShape || null,
+                _checkOrder: Math.max(0, +g.checkOrder || +pu._checkOrder || (gi + 1)),
+            };
+            if (!seed.marks || !seed.marks.length)
+                seed.marks = [seed.mark, g.mark].filter(Boolean);
+            const phase0 = (typeof normalizeUnit === 'function')
+                ? normalizeUnit(seed)
+                : null;
+            const u = phase0
+                ? Object.assign({}, phase0, {
+                    stableBundleMm: phase0.stableBundleMm
+                        ? Object.assign({}, phase0.stableBundleMm)
+                        : null,
+                    _groupByQuat: phase0._groupByQuat
+                        ? Object.assign({}, phase0._groupByQuat)
+                        : phase0._groupByQuat,
+                    marks: phase0.marks ? phase0.marks.slice() : seed.marks,
+                })
+                : Object.assign({}, seed);
+            if (pu.bundle_bbox && !u.bundle_bbox)
+                u.bundle_bbox = { ...pu.bundle_bbox };
 
-            u.groupKind = u.groupKind || g.groupKind || null;
-            u.shapeKey = u.shapeKey || g.shapeKey || g.profileShape || u.profileShape || null;
-            u._checkOrder = Math.max(0, +g.checkOrder || +pu._checkOrder || (gi + 1));
-            if (!u.marks || !u.marks.length) {
-                u.marks = [u.mark, g.mark].filter(Boolean);
-            }
             // Durable IFC shipping fields (Phase 2 extract) — prefer for pack LWH
             if (!(+u.shippingLengthMm > 0) && +pu.shippingLengthMm > 0)
                 u.shippingLengthMm = +pu.shippingLengthMm;
@@ -714,8 +907,17 @@ function csPackV2BuildUnits(groups, opts) {
             if (!(+u.flangeWidthMm > 0) && +pu.flangeWidthMm > 0)
                 u.flangeWidthMm = +pu.flangeWidthMm;
 
-            // Step 1 — footprint normalize on the clone
-            csPackNormalizePackUnit(u, o);
+            // Step 1 — further footprint normalize (assemblies / plates).
+            // Skip remorph when Phase 0 already repaired a pitched nest width.
+            if (!(u._nestRepaired && csPackIsNestUnit(u)))
+                csPackNormalizePackUnit(u, o);
+            // Keep Phase 0 freeze flags after Step 1
+            u.isFrozen = true;
+            u.isShipPrepped = true;
+            u._freezeGroupByPose = true;
+            u._shipPrepped = true;
+            u._pack25dFreezePose = true;
+            u._phase0Normalized = true;
 
             // After normalize, pack* is authoritative (do NOT max() with raw world
             // widthMm/heightMm — that re-inflates ship-axis / nest repairs).
@@ -6734,6 +6936,28 @@ function csPackNormalizeSelfTest() {
     function check(id, cond, detail) {
         results.push({ id, ok: !!cond, detail: detail || '' });
     }
+
+    // Phase 0 — freeze quat, nest repair formula, flags, no input mutate
+    const p0src = {
+        mark: 'Z200 · set 1',
+        groupKind: 'nest_z',
+        shapeKey: 'z_channel',
+        sectW: 85,
+        qty: 4,
+        nestingOffsetMm: 40,
+        stableBundleMm: { l: 9600, w: 1800, h: 200, source: 'ship_prep' },
+        _groupByQuat: { x: 0.1, y: 0.2, z: 0.3, w: 0.9 },
+    };
+    const p0 = normalizeUnit(p0src);
+    const expectW = (85 * 4) + (40 * 3); // 460
+    check('P0a', !!p0 && p0.isFrozen === true && p0.isShipPrepped === true
+        && Object.isFrozen(p0)
+        && p0._groupByQuat.x === 0.1 && p0._groupByQuat.w === 0.9
+        && p0src.stableBundleMm.w === 1800
+        && p0.packWidthMm === expectW
+        && p0._fmUid
+        && p0._nestRepaired === true,
+        `pw=${p0 && p0.packWidthMm} expect=${expectW} frozen=${p0 && Object.isFrozen(p0)}`);
 
     // Pitched nest → repaired
     const fat = {
