@@ -4978,8 +4978,16 @@ function csPackV2IsStackCandidate(unit, support, envelope, opts) {
 
     design.supportTier = csPackV2SupportTier(support);
     design.newTier = design.supportTier + 1;
-    design.tierOk = design.newTier <= CSPACK_V2_STACK_MAX_TIERS;
+    const maxTiers = (o.maxTiers != null && +o.maxTiers > 0)
+        ? Math.floor(+o.maxTiers) : CSPACK_V2_STACK_MAX_TIERS;
+    design.tierOk = design.newTier <= maxTiers;
     if (!design.tierOk) reasons.push('MAX_TIERS');
+
+    if (o.maxSupportTopMm != null && +o.maxSupportTopMm > 0
+        && +support.topY > +o.maxSupportTopMm + CSPACK_V2_EPS) {
+        design.heightOk = false;
+        reasons.push('SUPPORT_TOO_HIGH');
+    }
 
     const wKg = Math.max(+unit.weightKg || 0, +unit.total_weight || 0, 0);
     const cap = (support.capacityKg != null && +support.capacityKg > 0)
@@ -5398,6 +5406,8 @@ function csPackV2TryStackSeatAt(unit, support, x, z, opts) {
         x, z,
         bearingMin: o.bearingMin,
         containerSpec: o.containerSpec,
+        maxTiers: o.maxTiers,
+        maxSupportTopMm: o.maxSupportTopMm,
     });
     if (!candidate.ok) {
         return empty(candidate.reason || 'NOT_CANDIDATE', {
@@ -6189,6 +6199,8 @@ function csPackV2PlaceNestStacks(units, placed, opts) {
                 containerSpec: o.containerSpec,
                 placedBoxes: boxes,
                 bearingMin: o.bearingMin,
+                maxTiers: o.maxTiers,
+                maxSupportTopMm: o.maxSupportTopMm,
             });
             tried.push({
                 supportId: support.id,
@@ -9025,11 +9037,16 @@ function csPackV2PackHuman(units, opts) {
     if (enableStacks && typeof csPackV2PlaceNestStacks === 'function') {
         // Only leftovers may climb — and only onto a heavier / equal pad
         // (HEAVIER_THAN_BASE is enforced inside the stack candidate rules).
+        // Human loads stay low: max 2 tiers and never above ~half the box, or
+        // thin nests climb to the roof and look like they are floating.
         const leftUnits = unplaced.map(u => u && (u.unit || u)).filter(Boolean);
+        const humanMaxTop = Math.min(+env.heightMm * 0.45, 1200);
         stackPass = csPackV2PlaceNestStacks(leftUnits, placed, {
             envelope: env,
             containerSpec: o.containerSpec,
             bearingMin: o.bearingMin,
+            maxTiers: 2,
+            maxSupportTopMm: humanMaxTop,
         });
         placed = (stackPass.placed || placed).slice();
         const stackedUids = new Set(
