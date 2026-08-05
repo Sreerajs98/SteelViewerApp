@@ -249,6 +249,7 @@ document.getElementById('btnOptimize').addEventListener('click', () => setMode('
 
 // Staging wrapper — calls the original core function directly (no recursion)
 function loadScene(data) {
+  window._sharedAssemblyQuats = {};
   _coreLoadScene(data);
 
   // Build AssemblyGroups from the scene data (using GroupingService output

@@ -135,6 +135,68 @@ function cstabPrincipalAxesFromPoints(xyz) {
 }
 
 /**
+ * Load / yard: remove plan-view chariv on long rafters only.
+ * Snap plan PCA long-axis to nearest world X/Z via world-Y rotation.
+ * (AABB short-side search fails on kinked portal rafters — leaves ~8–13° skew.)
+ */
+function cstabKillRafterChariv(mesh, it) {
+  if (!mesh || !it || typeof THREE === 'undefined') return false;
+  const sc = (typeof SCALE === 'number' && SCALE > 0) ? SCALE : 0.01;
+  mesh.updateMatrixWorld(true);
+  const bb0 = new THREE.Box3().setFromObject(mesh);
+  if (!isFinite(bb0.min.x)) return false;
+  const meshLenMm = Math.max(bb0.max.x - bb0.min.x, bb0.max.z - bb0.min.z) / sc;
+  const name = String(it.assemblyName || it.mark || '').toUpperCase();
+  const looksRafter = meshLenMm > 3000
+    || name.includes('RAFTER') || /RF\d/i.test(String(it.mark || it.assemblyName || ''));
+  if (!looksRafter) return false;
+  if (!(it.assemblyShipPose || it.groupKind === 'welded_assembly' || it.isAssembly
+      || name.includes('RAFTER') || /RF\d/i.test(String(it.mark || ''))))
+    return false;
+
+  // 2D PCA on world XZ samples → plan long-axis angle
+  const pts = [];
+  mesh.traverse(o => {
+    if (!o.isMesh || !o.geometry) return;
+    const pos = o.geometry.attributes && o.geometry.attributes.position;
+    if (!pos) return;
+    const step = Math.max(1, Math.floor(pos.count / 120));
+    const v = new THREE.Vector3();
+    for (let i = 0; i < pos.count; i += step) {
+      v.fromBufferAttribute(pos, i);
+      v.applyMatrix4(o.matrixWorld);
+      pts.push(v.x, v.z);
+    }
+  });
+  if (pts.length < 6) return false;
+  let mx = 0, mz = 0, n = pts.length / 2;
+  for (let i = 0; i < pts.length; i += 2) { mx += pts[i]; mz += pts[i + 1]; }
+  mx /= n; mz /= n;
+  let cxx = 0, czz = 0, cxz = 0;
+  for (let i = 0; i < pts.length; i += 2) {
+    const x = pts[i] - mx, z = pts[i + 1] - mz;
+    cxx += x * x; czz += z * z; cxz += x * z;
+  }
+  let ang = 0.5 * Math.atan2(2 * cxz, cxx - czz); // rad, long-axis in XZ
+  // Nearest world axis (0 or ±90°). premultiply(+Y) increases measured ang → use -ang to cancel.
+  const quarter = Math.PI / 2;
+  const snapped = Math.round(ang / quarter) * quarter;
+  const delta = ang - snapped; // amount measured past axis; rotate opposite
+  if (Math.abs(delta) < 0.002) { // already < ~0.1°
+    if (typeof nailMeshToGroundY === 'function') nailMeshToGroundY(mesh, 0);
+    return true;
+  }
+  mesh.quaternion.premultiply(
+    new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), delta)
+  );
+  mesh.rotation.setFromQuaternion(mesh.quaternion);
+  mesh.updateMatrixWorld(true);
+  if (typeof nailMeshToGroundY === 'function') nailMeshToGroundY(mesh, 0);
+  else if (typeof csNzSnapObjectToGround === 'function') csNzSnapObjectToGround(mesh);
+  return true;
+}
+
+/**
  * Rigid-rotate group so principal longest → world +X (cancels IFC pitch/lean).
  * Roll around X left for face trials.
  */
@@ -573,6 +635,10 @@ function straightenYardItemOnGround(mesh, it) {
   } catch (_) { /* */ }
 
   // 1) Cancel IFC roof-pitch / upright columns → length along +X
+  if (it?.assemblyShipPose || it?.groupKind === 'welded_assembly') {
+    mesh.userData._isWeldedAssembly = true;
+    mesh.userData.mark = it?.mark || '';
+  }
   const alignInfo = (typeof cstabAlignLongestToWorldX === 'function')
     ? cstabAlignLongestToWorldX(mesh)
     : { ok: false };
@@ -929,6 +995,28 @@ function straightenYardItemOnGround(mesh, it) {
       };
     }
   }
+  // Rafter plan chariv: discrete world-Y {0,±90,180} after best pose freeze
+  if (typeof cstabKillRafterChariv === 'function' && cstabKillRafterChariv(mesh, it)) {
+    try {
+      const q = mesh.quaternion;
+      if (it) it._groupByQuat = { x: q.x, y: q.y, z: q.z, w: q.w };
+    } catch (_) { /* */ }
+  }
+  // Share pose across identical assemblies (same assemblyName)
+  if (it?.assemblyName && it._groupByQuat) {
+    if (!window._sharedAssemblyQuats) window._sharedAssemblyQuats = {};
+    const key = it.assemblyName;
+    if (window._sharedAssemblyQuats[key]) {
+      // Copy existing pose from same assembly type
+      const shared = window._sharedAssemblyQuats[key];
+      mesh.quaternion.set(shared.x, shared.y, shared.z, shared.w);
+      mesh.rotation.setFromQuaternion(mesh.quaternion);
+      it._groupByQuat = { ...shared };
+    } else {
+      // First of this type — store pose for others
+      window._sharedAssemblyQuats[key] = { ...it._groupByQuat };
+    }
+  }
   try {
     if (!mesh.userData) mesh.userData = {};
     mesh.userData._stabilityApplied = true;
@@ -936,15 +1024,6 @@ function straightenYardItemOnGround(mesh, it) {
     if (it && it._groupByQuat) mesh.userData._groupByQuat = { ...it._groupByQuat };
   } catch (_) { /* */ }
 
-  try {
-    const tg = bottomTipGap();
-    console.info(
-      `[yard-straight] ${it?.mark || '?'} pose=${best.tag}`
-      + ` ground=${finalEv.ground_touch} lying=${!finalEv.standing_on_end}`
-      + ` tip=${(finalEv.tip_ratio || 0).toFixed(2)}`
-      + ` tipGap=${tg.toFixed(4)}`
-    );
-  } catch (_) { /* */ }
   return finalEv;
 }
 

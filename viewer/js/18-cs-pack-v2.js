@@ -238,6 +238,10 @@ function normalizeUnit(packUnit) {
         flangeWidthMm: packUnit.flangeWidthMm,
         _checkOrder: packUnit._checkOrder,
         _keepGroupByBundle: packUnit._keepGroupByBundle,
+        // SteelIntel metadata — preserve reference only (no recompute)
+        siHints: packUnit.siHints || null,
+        packUnitIndex: packUnit.packUnitIndex,
+        stagingGroupId: packUnit.stagingGroupId || null,
         tipGapMm: packUnit.tipGapMm,
         // (a) quat frozen as provided
         _groupByQuat: groupByQuat !== undefined ? groupByQuat : packUnit._groupByQuat,
@@ -391,11 +395,17 @@ function csPackNormalizePackUnit(u, opts) {
         && +sbFit.h <= Math.min(+sbFit.l, +sbFit.w) * 0.55 + CSPACK_V2_EPS
         && +sbFit.h <= 1200 + CSPACK_V2_EPS
         && (sbTip == null || sbTip <= 80);
+    // groupby_mesh_aabb = Optimise-only stamp from live Group By mesh AABB.
+    // Trust it even when over-wide (honest FOOTPRINT_EXCEEDS) — do not remorph
+    // back to thin flange seats that dig when the drawn mesh is larger.
+    const sbSrc = String((sbFit && sbFit.source) || '');
+    const fromGroupByMesh = /groupby_mesh_aabb/i.test(sbSrc);
     const measuredSeat = !!sbFit
-        && /ship_prep|yard_straighten/i.test(String(sbFit.source || ''))
+        && (/ship_prep|yard_straighten/i.test(sbSrc) || fromGroupByMesh)
         && +sbFit.l > 0 && +sbFit.w > 0 && +sbFit.h > 0
         && (
-            sbIsFlat
+            fromGroupByMesh
+            || sbIsFlat
             || (+sbFit.w <= Wcap + CSPACK_V2_EPS
                 && +sbFit.h <= Hcap + CSPACK_V2_EPS)
         );
@@ -403,6 +413,28 @@ function csPackNormalizePackUnit(u, opts) {
         // Take the measurement verbatim; the max() blend above can only inflate
         // it, and widthMm/heightMm are rewritten from pw/ph further down.
         pl = +sbFit.l; pw = +sbFit.w; ph = +sbFit.h;
+    }
+    if (fromGroupByMesh && measuredSeat) {
+        const beforeGb = `${u.packLengthMm}|${u.packWidthMm}|${u.packHeightMm}`;
+        u.packLengthMm = pl;
+        u.packWidthMm = pw;
+        u.packHeightMm = ph;
+        u.packFootprintL = pl;
+        u.packFootprintW = pw;
+        u.packFootprintH = ph;
+        u.lengthMm = pl;
+        u.widthMm = pw;
+        u.heightMm = ph;
+        u.stableBundleMm = {
+            ...(u.stableBundleMm || {}),
+            l: pl, w: pw, h: ph,
+            source: 'groupby_mesh_aabb',
+        };
+        const afterGb = `${u.packLengthMm}|${u.packWidthMm}|${u.packHeightMm}`;
+        return {
+            changed: beforeGb !== afterGb,
+            reason: beforeGb !== afterGb ? 'groupby_mesh_aabb' : null,
+        };
     }
 
     // ── Assemblies: stamp + ship-axis sanitize (never nest-formula remorph) ─
@@ -491,8 +523,13 @@ function csPackNormalizePackUnit(u, opts) {
         }
         // Prefer thin axis as thickness (H); longest as L; remaining as W
         const dims = [pl, pw, ph].filter(v => v > 0).sort((a, b) => a - b);
-        let tHint = Math.max(+u.sectT || 0, +u.sectH || 0);
+        // Section stamp first (Tekla plates carry thickness in sectH, not sectT)
+        let tHint = (typeof resolvePlateSectionDims === 'function')
+            ? resolvePlateSectionDims(u).thicknessMm
+            : Math.max(+u.sectT || 0, +u.sectH || 0);
         if (!(tHint > 0 && tHint <= 80)) tHint = dims[0] || ph;
+        // Measured plan width — the middle axis, since thin is thickness
+        const measuredPlanW = dims.length >= 2 ? dims[dims.length - 2] : 0;
         // Mark patterns like "3000*200" / "PL1.5*2500"
         const mark = String(u.mark || '');
         const mPair = mark.match(/(\d+(?:\.\d+)?)\s*[*xX]\s*(\d+(?:\.\d+)?)/);
@@ -505,9 +542,13 @@ function csPackNormalizePackUnit(u, opts) {
                 // "PL30*265" is thickness*width; the length is not in the mark,
                 // so it has to come from the measured plan. Reading it as L*W
                 // booked a 590 mm plate as 265 and let it stick out of the wall.
+                // The mark width is stock width though — a strip cut from 2270
+                // stock measures 71 mm across and must not book a 2270 seat.
                 tHint = a;
-                plateW = b;
-                plateL = Math.max(pl, pw, b);
+                plateW = (measuredPlanW > 0 && b > measuredPlanW + CSPACK_V2_EPS)
+                    ? measuredPlanW
+                    : b;
+                plateL = Math.max(pl, pw, plateW);
             } else {
                 plateL = Math.max(a, b);
                 plateW = Math.min(a, b);
@@ -894,6 +935,12 @@ function csPackV2BuildUnits(groups, opts) {
                     marks: phase0.marks ? phase0.marks.slice() : seed.marks,
                 })
                 : Object.assign({}, seed);
+            // Preserve SI hints across Phase-0 clone (do not recompute)
+            u.siHints = pu.siHints || u.siHints || null;
+            if (u.packUnitIndex == null && pu.packUnitIndex != null)
+                u.packUnitIndex = pu.packUnitIndex;
+            if (!u.stagingGroupId)
+                u.stagingGroupId = pu.stagingGroupId || (g && g.id) || null;
             if (pu.bundle_bbox && !u.bundle_bbox)
                 u.bundle_bbox = { ...pu.bundle_bbox };
 
@@ -940,6 +987,21 @@ function csPackV2BuildUnits(groups, opts) {
             u.packFootprintL = pl;
             u.packFootprintW = pw;
             u.packFootprintH = ph;
+            // For welded assemblies lying flat for shipping, ph (height) should be
+            // the cross-section depth (~300mm), not the IFC upright height (~2489mm).
+            // Skip when Optimise stamped Group By mesh AABB — that seat is truth.
+            if (u.groupKind === 'welded_assembly' && u.stableBundleMm
+                && !/groupby_mesh_aabb/i.test(String(u.stableBundleMm.source || ''))) {
+              const csDepth = Math.min(
+                +u.stableBundleMm.w || 9999,
+                +u.stableBundleMm.h || 9999
+              );
+              if (csDepth > 0 && csDepth < ph * 0.5) {
+                u.packFootprintH = csDepth;
+                u.packHeightMm   = csDepth;
+                ph               = csDepth;
+              }
+            }
             // Keep pack-facing dims in sync (construction sect* untouched)
             u.lengthMm = pl;
             u.widthMm = pw;
@@ -977,10 +1039,38 @@ function csPackV2BuildUnits(groups, opts) {
         u.l = pl; u.w = pw; u.h = ph;
     });
 
+    // TEMP SI debug — confirm _checkOrder survives into BuildUnits sort
+    function _siOrderSnap(units) {
+        return (units || []).map(u => ({
+            id: (u && u._srcGroup && u._srcGroup.id)
+                || (u && u.stagingGroupId) || null,
+            packUnitIndex: (u && u.packUnitIndex != null)
+                ? u.packUnitIndex
+                : (u && u._srcPackUnit && u._srcPackUnit.packUnitIndex),
+            checkOrder: u ? u._checkOrder : null,
+            mark: u ? u.mark : null,
+            // extras for SI vs group override diagnosis
+            pu_checkOrder: u && u._srcPackUnit ? u._srcPackUnit._checkOrder : null,
+            g_checkOrder: u && u._srcGroup ? u._srcGroup.checkOrder : null,
+            loadSeq: u && u.siHints ? u.siHints.loadSeq : null,
+        }));
+    }
+    try {
+        var _before = _siOrderSnap(list);
+        console.log('[SI-order] BEFORE BuildUnits sort', _before);
+        if (typeof window !== 'undefined') window.__siOrderBefore = _before;
+    } catch (_) { /* */ }
+
     list.sort((a, b) =>
         (+a._checkOrder || 99999) - (+b._checkOrder || 99999)
         || (+b.weightKg || 0) - (+a.weightKg || 0)
         || String(a._fmUid).localeCompare(String(b._fmUid)));
+
+    try {
+        var _after = _siOrderSnap(list);
+        console.log('[SI-order] AFTER BuildUnits sort', _after);
+        if (typeof window !== 'undefined') window.__siOrderAfter = _after;
+    } catch (_) { /* */ }
 
     return list;
 }
@@ -1168,6 +1258,31 @@ function csPackV2InitialFreeRects(spec) {
         supportedBy: 'floor',
         supportCapacityKg: 1e12,
     };
+    // TEMP SI free-rect trace — initial floor only (no placement change)
+    try {
+        if (typeof window !== 'undefined') {
+            if (!window.__siFreeRectTrace) window.__siFreeRectTrace = [];
+            window.__siFreeRectTrace.push({
+                event: 'initial',
+                placedLoadSeq: null,
+                placedZonePref: null,
+                rectBefore: null,
+                newRects: [{
+                    x: +rect.x,
+                    z: +rect.z,
+                    w: +rect.length, // along X (rear→door)
+                    d: +rect.width,  // along Z (home→far)
+                    id: rect.id,
+                }],
+                envelope: {
+                    minX: +env.minXMm,
+                    maxX: +env.maxXMm,
+                    minZ: +env.minZMm,
+                    maxZ: +env.maxZMm,
+                },
+            });
+        }
+    } catch (_) { /* */ }
     return { freeRects: [rect], envelope: env };
 }
 
@@ -1440,6 +1555,66 @@ function csPackV2CommitFloorSeat(unit, seat, opts) {
         layer: 'floor',
         gravity: 'floor_y0',
     };
+
+    // TEMP SI zone-occupancy trace (no seat / geometry change)
+    try {
+        if (typeof window !== 'undefined') {
+            if (!window.__siZoneOccupancyTrace)
+                window.__siZoneOccupancyTrace = [];
+            const src = unit._srcPackUnit;
+            const h = unit.siHints || (src && src.siHints) || null;
+            const env = o.envelope
+                || (o.containerSpec
+                    ? csPackV2FloorEnvelope(o.containerSpec)
+                    : null);
+            const minX = env ? +env.minXMm : 0;
+            const maxX = env ? +env.maxXMm : (x + pl);
+            const clearL = Math.max((env && +env.lengthMm)
+                || (maxX - minX), 1);
+            // Rear pocket = rear third along X (minX → door)
+            const rearEnd = minX + clearL / 3;
+            // Door clear = door third
+            const doorStart = maxX - clearL / 3;
+            const placedX1 = x;
+            const placedX2 = x + pl;
+            const overlaps = (a0, a1, b0, b1) =>
+                !(a1 <= b0 + CSPACK_V2_EPS || b1 <= a0 + CSPACK_V2_EPS);
+            const consumesRearZone = overlaps(placedX1, placedX2, minX, rearEnd);
+            const consumesDoorZone = overlaps(placedX1, placedX2, doorStart, maxX);
+            // How much of the rear-third X span this box covers (mm)
+            const rearOverlapMm = consumesRearZone
+                ? Math.max(0,
+                    Math.min(placedX2, rearEnd) - Math.max(placedX1, minX))
+                : 0;
+            const row = {
+                loadSeq: h && h.loadSeq != null
+                    ? h.loadSeq
+                    : (unit._checkOrder != null ? unit._checkOrder : null),
+                mark: unit.mark || null,
+                zonePref: h ? h.zonePref : null,
+                bundleType: h ? h.bundleType : (unit.groupKind || null),
+                pairSide: h ? h.pairSide : null,
+                placedX: x,
+                placedZ: z,
+                footprintW: pl, // along X
+                footprintD: pw, // along Z
+                consumesRearZone: consumesRearZone,
+                consumesDoorZone: consumesDoorZone,
+                rearOverlapMm: rearOverlapMm,
+                rearBand: { minX: minX, rearEnd: rearEnd },
+            };
+            window.__siZoneOccupancyTrace.push(row);
+            // First placement that eats the rear pocket (for quick console)
+            if (consumesRearZone
+                && !window.__siFirstRearConsumer) {
+                window.__siFirstRearConsumer = row;
+                try {
+                    console.log('[SI-zone-occupancy] FIRST rear consumer', row);
+                } catch (_) { /* */ }
+            }
+        }
+    } catch (_) { /* */ }
+
     return { ok: true, reason: null, placement };
 }
 
@@ -1774,6 +1949,67 @@ function csPackV2ApplySplit(freeRects, rect, placement, opts) {
     for (let j = 0; j < split.leftovers.length; j++)
         next.push(split.leftovers[j]);
 
+    // TEMP SI free-rect trace — every successful split (no placement change)
+    try {
+        if (typeof window !== 'undefined') {
+            if (!window.__siFreeRectTrace) window.__siFreeRectTrace = [];
+            const oTrace = opts || {};
+            const unit = oTrace.unit
+                || (placement && placement.unit)
+                || null;
+            const src = unit && unit._srcPackUnit;
+            const h = (unit && unit.siHints) || (src && src.siHints) || null;
+            const snapRect = (r) => (!r ? null : {
+                x: +r.x,
+                z: +r.z,
+                w: +r.length, // X extent
+                d: +r.width,  // Z extent
+                id: r.id || null,
+            });
+            const minX = next.length
+                ? Math.min.apply(null, next.map(r => +r.x))
+                : null;
+            // Rear = envelope minX (from initial trace), not the consumed rect
+            let envMinX = 2.5;
+            const initEv = window.__siFreeRectTrace.find(e => e && e.event === 'initial');
+            if (initEv && initEv.envelope && initEv.envelope.minX != null)
+                envMinX = +initEv.envelope.minX;
+            const hasRearOrigin = next.some(r =>
+                r && +r.x <= envMinX + 1 + CSPACK_V2_EPS);
+            // Usable rear pocket: origin at minX and enough X depth (>= 500 mm)
+            const hasUsableRear = next.some(r =>
+                r && +r.x <= envMinX + 1 + CSPACK_V2_EPS
+                && +r.length >= 500 - CSPACK_V2_EPS);
+            window.__siFreeRectTrace.push({
+                event: 'split',
+                placedLoadSeq: h && h.loadSeq != null
+                    ? h.loadSeq
+                    : (unit && unit._checkOrder != null ? unit._checkOrder : null),
+                placedZonePref: h ? h.zonePref : null,
+                placedMark: (unit && unit.mark)
+                    || (placement && placement.mark) || null,
+                corner: split.corner || null,
+                policy: split.policy || null,
+                rectBefore: {
+                    x: +rect.x,
+                    z: +rect.z,
+                    w: +rect.length,
+                    d: +rect.width,
+                },
+                newRects: (split.leftovers || []).map(r => ({
+                    x: +r.x,
+                    z: +r.z,
+                    w: +r.length,
+                    d: +r.width,
+                })),
+                freeRectsAfter: next.map(snapRect),
+                afterMinX: minX,
+                rearOriginAvailable: hasRearOrigin,
+                usableRearAvailable: hasUsableRear,
+            });
+        }
+    } catch (_) { /* */ }
+
     return {
         ok: true,
         reason: null,
@@ -2014,12 +2250,119 @@ function csPackV2ClassifyUnplaced(unit, envelope, opts) {
 }
 
 /**
- * Score a candidate free-rect seat (lower = better).
- * Home wall → rear → least wasted area.
+ * Map SI zonePref → packer envelope bands.
+ *
+ * Packer coords (csPackV2InitialFreeRects):
+ *   x = rear → door   (minX = rear, maxX = door)
+ *   z = home → far    (minZ = home wall, maxZ = far wall)
+ *   y = floor → up
+ *
+ * @returns {{ zoneMatch: boolean|null, zonePenalty: number|null }}
+ *   null = no SI zone preference (legacy scoring only)
  */
-function csPackV2ScoreFloorCandidate(rect, pl, pw) {
+function csPackV2ZoneScore(zonePref, candidateX, candidateZ, pl, pw, env) {
+    if (!zonePref || !env) {
+        return { zoneMatch: null, zonePenalty: null };
+    }
+    const zp = String(zonePref);
+    const minX = +env.minXMm;
+    const maxX = +env.maxXMm;
+    const minZ = +env.minZMm;
+    const maxZ = +env.maxZMm;
+    const len = Math.max(+env.lengthMm || (maxX - minX), 1);
+    const wid = Math.max(+env.widthMm || (maxZ - minZ), 1);
+    const cx = +candidateX;
+    const cz = +candidateZ;
+    const fpl = Math.max(+pl || 0, 0);
+    const fpw = Math.max(+pw || 0, 0);
+    const zc = cz + fpw * 0.5;
+    const xc = cx + fpl * 0.5;
+    // Band tolerances (~15% of clear span, min 80 mm)
+    const zTol = Math.max(80, wid * 0.15);
+    const xTol = Math.max(80, len * 0.15);
+    const midZ = (minZ + maxZ) * 0.5;
+    const rearLimit = minX + len / 3;   // rear third (low X)
+    const doorStart = maxX - len / 3;   // door third (high X)
+
+    if (zp === 'Z_HOME_BASE') {
+        const pen = Math.max(0, cz - minZ);
+        return { zoneMatch: pen <= zTol, zonePenalty: pen };
+    }
+    if (zp === 'Z_FAR_BASE') {
+        const farEdge = cz + fpw;
+        const pen = Math.max(0, maxZ - farEdge);
+        return { zoneMatch: pen <= zTol, zonePenalty: pen };
+    }
+    if (zp === 'Z_REAR_POCKET') {
+        const pen = Math.max(0, cx - minX);
+        return { zoneMatch: xc <= rearLimit + xTol, zonePenalty: pen };
+    }
+    if (zp === 'Z_CENTRE_FLOOR') {
+        const pen = Math.abs(zc - midZ);
+        return { zoneMatch: pen <= wid * 0.25, zonePenalty: pen };
+    }
+    if (zp === 'Z_DOOR_CLEAR') {
+        const pen = Math.max(0, doorStart - cx);
+        return { zoneMatch: xc >= doorStart - xTol, zonePenalty: pen };
+    }
+    if (zp === 'Z_UPPER' || zp === 'Z_OUT') {
+        // Floor scorer cannot place these; do not bias floor seats
+        return { zoneMatch: null, zonePenalty: null };
+    }
+    return { zoneMatch: null, zonePenalty: null };
+}
+
+/**
+ * Score a candidate free-rect seat (lower = better).
+ * With SI zonePref: zonePenalty first, then home-wall z → rear x → waste.
+ * Without siHints/zonePref: legacy z → x → waste only.
+ *
+ * @param {object} rect
+ * @param {number} pl
+ * @param {number} pw
+ * @param {object} [opts]  { unit, candidateX, candidateZ, envelope }
+ */
+function csPackV2ScoreFloorCandidate(rect, pl, pw, opts) {
+    const o = opts || {};
     const waste = Math.max(0, (+rect.length * +rect.width) - (pl * pw));
+    const unit = o.unit || null;
+    const src = unit && unit._srcPackUnit;
+    const hints = (unit && unit.siHints) || (src && src.siHints) || null;
+    const zonePref = hints && hints.zonePref ? hints.zonePref : null;
+    const candX = (o.candidateX != null) ? +o.candidateX : +rect.x;
+    const candZ = (o.candidateZ != null) ? +o.candidateZ : +rect.z;
+    const env = o.envelope || null;
+    const zone = csPackV2ZoneScore(zonePref, candX, candZ, pl, pw, env);
+
+    // TEMP SI diagnostic — zone mapping (trace only; selection unchanged by this log)
+    try {
+        const loadSeq = hints && hints.loadSeq != null
+            ? hints.loadSeq
+            : (unit && unit._checkOrder);
+        const row = {
+            loadSeq: loadSeq,
+            zonePref: zonePref,
+            candidateX: candX,
+            candidateZ: candZ,
+            containerMinX: env ? +env.minXMm : null,
+            containerMaxX: env ? +env.maxXMm : null,
+            zonePenalty: zone.zonePenalty,
+            zoneMatch: zone.zoneMatch,
+        };
+        console.log('[SI-zone-debug]', row);
+        if (typeof window !== 'undefined') {
+            if (!window.__siZoneDebug) window.__siZoneDebug = [];
+            // Cap capture to keep memory sane
+            if (window.__siZoneDebug.length < 4000) {
+                window.__siZoneDebug.push(row);
+            }
+        }
+    } catch (_) { /* */ }
+
     return {
+        // null zonePenalty → CandidateBetter skips (legacy path)
+        zonePenalty: zone.zonePenalty,
+        zoneMatch: zone.zoneMatch,
         z: +rect.z,
         x: +rect.x,
         waste,
@@ -2029,9 +2372,38 @@ function csPackV2ScoreFloorCandidate(rect, pl, pw) {
 function csPackV2CandidateBetter(a, b) {
     if (!a) return false;
     if (!b) return true;
-    if (a.score.z !== b.score.z) return a.score.z < b.score.z;
-    if (a.score.x !== b.score.x) return a.score.x < b.score.x;
-    if (a.score.waste !== b.score.waste) return a.score.waste < b.score.waste;
+    const sa = a.score || {};
+    const sb = b.score || {};
+    // SI zone preference: first priority when both sides have a penalty
+    const za = sa.zonePenalty;
+    const zb = sb.zonePenalty;
+    // TEMP SI diagnostic — confirm zonePenalty reaches comparator (trace only)
+    try {
+        if (typeof window !== 'undefined'
+            && (za != null || zb != null)
+            && window.__siZoneBetterTrace
+            && window.__siZoneBetterTrace.length < 200) {
+            window.__siZoneBetterTrace.push({
+                za: za,
+                zb: zb,
+                preferA: (za != null && zb != null && za !== zb)
+                    ? (za < zb)
+                    : (za != null && zb == null)
+                        ? true
+                        : (za == null && zb != null)
+                            ? false
+                            : null,
+                aZ: sa.z, bZ: sb.z, aX: sa.x, bX: sb.x,
+            });
+        }
+    } catch (_) { /* */ }
+    if (za != null && zb != null && za !== zb) return za < zb;
+    if (za != null && zb == null) return true;
+    if (za == null && zb != null) return false;
+    // Legacy: home wall → rear → least waste
+    if (sa.z !== sb.z) return sa.z < sb.z;
+    if (sa.x !== sb.x) return sa.x < sb.x;
+    if (sa.waste !== sb.waste) return sa.waste < sb.waste;
     return false;
 }
 
@@ -2048,11 +2420,48 @@ function csPackV2FindFloorSeat(unit, freeRects, opts) {
     // Group By Z/C nests keep length along X (same as yard) — never yaw 90
     const allowYaw = o.allowYaw !== false && !csPackIsGroupByLockedNest(unit);
 
-    if (!(base.pl > 0 && base.pw > 0 && base.ph > 0))
+    // TEMP SI — per-call tallies for rear-pocket / watched loadSeq skip diagnosis
+    const srcPu0 = unit && unit._srcPackUnit;
+    const hints0 = (unit && unit.siHints) || (srcPu0 && srcPu0.siHints) || null;
+    const loadSeq0 = hints0 && hints0.loadSeq != null
+        ? hints0.loadSeq
+        : (unit && unit._checkOrder != null ? unit._checkOrder : null);
+    const zone0 = hints0 ? hints0.zonePref : null;
+    const watchSeat = (zone0 === 'Z_REAR_POCKET')
+        || (loadSeq0 != null && +loadSeq0 >= 71 && +loadSeq0 <= 76);
+    const failTally = watchSeat ? {
+        rectNull: 0,
+        outsideRect: 0,
+        heightExceeds: 0,
+        tryFail: {},
+        rearReserved: 0,
+        tryOk: 0,
+        cornerTried: 0,
+        yawSkippedSquare: 0,
+        rectsSeen: 0,
+        maxRectL: 0,
+        maxRectW: 0,
+        fitRectCount: 0,
+    } : null;
+
+    if (!(base.pl > 0 && base.pw > 0 && base.ph > 0)) {
+        if (watchSeat && typeof window !== 'undefined') {
+            if (!window.__siRearSkipTrace) window.__siRearSkipTrace = [];
+            window.__siRearSkipTrace.push({
+                stage: 'FindFloorSeat',
+                loadSeq: loadSeq0,
+                mark: unit && unit.mark,
+                zonePref: zone0,
+                reason: 'BAD_DIMS',
+                foot: base,
+                rectCount: rects.length,
+            });
+        }
         return {
             ok: false, reason: 'BAD_DIMS', seat: null, rect: null,
             score: null, yawDeg: 0, viewUnit: null, corner: null,
         };
+    }
 
     const yaws = allowYaw ? [0, 90] : [0];
     let best = null;
@@ -2064,7 +2473,10 @@ function csPackV2FindFloorSeat(unit, freeRects, opts) {
         const pw = yaw === 90 ? base.pl : base.pw;
         const ph = base.ph;
         // Skip redundant yaw when square footprint
-        if (yaw === 90 && Math.abs(base.pl - base.pw) <= CSPACK_V2_EPS) continue;
+        if (yaw === 90 && Math.abs(base.pl - base.pw) <= CSPACK_V2_EPS) {
+            if (failTally) failTally.yawSkippedSquare++;
+            continue;
+        }
 
         const viewUnit = {
             ...unit,
@@ -2079,19 +2491,31 @@ function csPackV2FindFloorSeat(unit, freeRects, opts) {
 
         for (let i = 0; i < rects.length; i++) {
             const rect = rects[i];
-            if (!rect) continue;
-            if (pl > +rect.length + CSPACK_V2_EPS || pw > +rect.width + CSPACK_V2_EPS) {
-                lastFail = 'OUTSIDE_RECT';
+            if (!rect) {
+                if (failTally) failTally.rectNull++;
                 continue;
             }
+            if (failTally) {
+                failTally.rectsSeen++;
+                failTally.maxRectL = Math.max(failTally.maxRectL, +rect.length || 0);
+                failTally.maxRectW = Math.max(failTally.maxRectW, +rect.width || 0);
+            }
+            if (pl > +rect.length + CSPACK_V2_EPS || pw > +rect.width + CSPACK_V2_EPS) {
+                lastFail = 'OUTSIDE_RECT';
+                if (failTally) failTally.outsideRect++;
+                continue;
+            }
+            if (failTally) failTally.fitRectCount++;
             const hAvail = (rect.heightAvailable != null) ? rect.heightAvailable : env.heightMm;
             if (ph > hAvail + CSPACK_V2_EPS) {
                 lastFail = 'HEIGHT_EXCEEDS';
+                if (failTally) failTally.heightExceeds++;
                 continue;
             }
             const corners = csPackV2RectCornerSeats(rect, pl, pw);
             for (let ci = 0; ci < corners.length; ci++) {
                 const c = corners[ci];
+                if (failTally) failTally.cornerTried++;
                 const seat = csPackV2TryFloorSeat(viewUnit, c.x, c.z, {
                     envelope: env,
                     rect,
@@ -2099,8 +2523,81 @@ function csPackV2FindFloorSeat(unit, freeRects, opts) {
                 });
                 if (!seat.ok) {
                     lastFail = seat.reason || 'REJECT';
+                    if (failTally) {
+                        const rk = lastFail;
+                        failTally.tryFail[rk] = (failTally.tryFail[rk] || 0) + 1;
+                    }
                     continue;
                 }
+                if (failTally) failTally.tryOk++;
+
+                // SI rear-pocket reservation — candidate filter only (no scoring change)
+                try {
+                    const srcPu = unit && unit._srcPackUnit;
+                    const hints = (unit && unit.siHints)
+                        || (srcPu && srcPu.siHints) || null;
+                    const zonePref = hints ? hints.zonePref : null;
+                    const resv = (typeof window !== 'undefined'
+                        && window.__siReservations
+                        && window.__siReservations.rearPocket)
+                        ? window.__siReservations.rearPocket
+                        : null;
+                    if (resv && resv.required
+                        && String(zonePref) !== 'Z_REAR_POCKET') {
+                        const minX = +env.minXMm;
+                        const clearL = Math.max(+env.lengthMm || 0, 1);
+                        const rearEnd = minX + clearL / 3;
+                        const cx0 = +c.x;
+                        const cx1 = cx0 + pl;
+                        const overlapsRear = !(cx1 <= minX + CSPACK_V2_EPS
+                            || rearEnd <= cx0 + CSPACK_V2_EPS);
+                        if (overlapsRear) {
+                            if (typeof window !== 'undefined') {
+                                if (!window.__siRearReservationTrace)
+                                    window.__siRearReservationTrace = [];
+                                window.__siRearReservationTrace.push({
+                                    loadSeq: hints && hints.loadSeq != null
+                                        ? hints.loadSeq
+                                        : (unit && unit._checkOrder != null
+                                            ? unit._checkOrder : null),
+                                    mark: unit ? unit.mark : null,
+                                    zonePref: zonePref,
+                                    candidateX: c.x,
+                                    candidateZ: c.z,
+                                    reason: 'rear_reserved',
+                                });
+                            }
+                            lastFail = 'REAR_RESERVED';
+                            if (failTally) failTally.rearReserved++;
+                            continue;
+                        }
+                    }
+                    // TEMP SI diagnostic — valid Z_REAR_POCKET candidates before scoring
+                    if (hints && String(hints.zonePref) === 'Z_REAR_POCKET'
+                        && typeof window !== 'undefined') {
+                        if (!window.__siRearCandidateTrace)
+                            window.__siRearCandidateTrace = [];
+                        window.__siRearCandidateTrace.push({
+                            loadSeq: hints.loadSeq != null
+                                ? hints.loadSeq
+                                : (unit._checkOrder != null
+                                    ? unit._checkOrder : null),
+                            mark: unit.mark || null,
+                            candidateX: c.x,
+                            candidateZ: c.z,
+                            footprintW: pl,
+                            footprintD: pw,
+                            zonePref: hints.zonePref,
+                        });
+                    }
+                } catch (_) { /* */ }
+
+                const score = csPackV2ScoreFloorCandidate(rect, pl, pw, {
+                    unit: unit,
+                    candidateX: c.x,
+                    candidateZ: c.z,
+                    envelope: env,
+                });
                 const cand = {
                     ok: true,
                     reason: null,
@@ -2109,11 +2606,12 @@ function csPackV2FindFloorSeat(unit, freeRects, opts) {
                     yawDeg: yaw,
                     viewUnit,
                     corner: c.corner,
-                    score: csPackV2ScoreFloorCandidate(rect, pl, pw),
+                    score: score,
                 };
-                // Prefer yaw 0 when scores equal
+                // Prefer yaw 0 when scores equal (incl. zonePenalty when present)
                 if (!best || csPackV2CandidateBetter(cand, best)
-                    || (cand.score.z === best.score.z
+                    || (cand.score.zonePenalty === best.score.zonePenalty
+                        && cand.score.z === best.score.z
                         && cand.score.x === best.score.x
                         && cand.score.waste === best.score.waste
                         && cand.yawDeg < best.yawDeg)) {
@@ -2124,10 +2622,42 @@ function csPackV2FindFloorSeat(unit, freeRects, opts) {
     }
 
     if (!best) {
+        if (watchSeat && typeof window !== 'undefined') {
+            if (!window.__siRearSkipTrace) window.__siRearSkipTrace = [];
+            window.__siRearSkipTrace.push({
+                stage: 'FindFloorSeat',
+                loadSeq: loadSeq0,
+                mark: unit && unit.mark,
+                zonePref: zone0,
+                reason: lastFail,
+                foot: base,
+                allowYaw: allowYaw,
+                rectCount: rects.length,
+                failTally: failTally,
+                outcome: 'no_best_candidate',
+            });
+        }
         return {
             ok: false, reason: lastFail, seat: null, rect: null,
             score: null, yawDeg: 0, viewUnit: null, corner: null,
         };
+    }
+    if (watchSeat && typeof window !== 'undefined') {
+        if (!window.__siRearSkipTrace) window.__siRearSkipTrace = [];
+        window.__siRearSkipTrace.push({
+            stage: 'FindFloorSeat',
+            loadSeq: loadSeq0,
+            mark: unit && unit.mark,
+            zonePref: zone0,
+            reason: null,
+            foot: base,
+            rectCount: rects.length,
+            failTally: failTally,
+            outcome: 'ok',
+            chosenX: best.seat && best.seat.x,
+            chosenZ: best.seat && best.seat.z,
+            yawDeg: best.yawDeg,
+        });
     }
     return best;
 }
@@ -9001,6 +9531,13 @@ function csPackV2MakeRenderItemFromUnit(unit) {
     }
 
     item.stagingGroupId = (g && g.id) || item.stagingGroupId || null;
+    // Preserve SteelIntel siHints from source packUnit / build unit (no recompute)
+    item.siHints = (src && src.siHints) || (unit && unit.siHints) || item.siHints || null;
+    if (item.packUnitIndex == null) {
+        item.packUnitIndex = (src && src.packUnitIndex != null)
+            ? src.packUnitIndex
+            : (unit && unit.packUnitIndex);
+    }
     if (g && g._groupByQuat && !item._groupByQuat)
         item._groupByQuat = { ...g._groupByQuat };
     if (item._groupByQuat) item._freezeGroupByPose = true;
@@ -9251,6 +9788,175 @@ function csPackV2SortHumanOrder(units) {
     return list;
 }
 
+/** SI loadSeq for a pack unit (hints first, else _checkOrder). */
+function csPackV2SiLoadSeq(unit) {
+    if (!unit) return 99999;
+    const src = unit._srcPackUnit;
+    const h = unit.siHints || (src && src.siHints) || null;
+    if (h && h.loadSeq != null && isFinite(+h.loadSeq)) return +h.loadSeq;
+    if (unit._checkOrder != null && isFinite(+unit._checkOrder)) return +unit._checkOrder;
+    return 99999;
+}
+
+function csPackV2IsRearPocketUnit(unit) {
+    if (!unit) return false;
+    const src = unit._srcPackUnit;
+    const h = unit.siHints || (src && src.siHints) || null;
+    return !!(h && String(h.zonePref) === 'Z_REAR_POCKET');
+}
+
+/**
+ * Reorder only Z_REAR_POCKET units inside an already loadSeq-sorted list.
+ * Non-rear slots stay fixed; rearPocket slots are filled by:
+ *   1) footprint area (pl*pw) descending
+ *   2) weight descending
+ *   3) original loadSeq ascending (tie break)
+ * Does not change FindFloorSeat / geometry / free-rect generation.
+ */
+function csPackV2ReorderRearPocketOrder(units) {
+    const list = Array.isArray(units) ? units : [];
+    const idxs = [];
+    const rear = [];
+    for (let i = 0; i < list.length; i++) {
+        if (!csPackV2IsRearPocketUnit(list[i])) continue;
+        idxs.push(i);
+        rear.push(list[i]);
+    }
+
+    function snapRow(u, slotIndex, orderIndex) {
+        const f = csPackV2Foot(u);
+        const src = u && u._srcPackUnit;
+        const h = (u && u.siHints) || (src && src.siHints) || null;
+        return {
+            orderIndex: orderIndex,
+            slotIndex: slotIndex,
+            loadSeq: csPackV2SiLoadSeq(u),
+            mark: u && u.mark || null,
+            zonePref: h ? h.zonePref : null,
+            bundleType: h ? h.bundleType : null,
+            packLengthMm: f.pl,
+            packWidthMm: f.pw,
+            areaMm2: f.pl * f.pw,
+            weightKg: csPackV2UnitWeightKg(u),
+        };
+    }
+
+    const before = rear.map((u, i) => snapRow(u, idxs[i], i));
+
+    rear.sort((a, b) => {
+        const fa = csPackV2Foot(a);
+        const fb = csPackV2Foot(b);
+        const areaA = fa.pl * fa.pw;
+        const areaB = fb.pl * fb.pw;
+        return (areaB - areaA)
+            || (csPackV2UnitWeightKg(b) - csPackV2UnitWeightKg(a))
+            || (csPackV2SiLoadSeq(a) - csPackV2SiLoadSeq(b))
+            || String(a && a._fmUid || '').localeCompare(String(b && b._fmUid || ''));
+    });
+
+    for (let i = 0; i < idxs.length; i++) {
+        list[idxs[i]] = rear[i];
+    }
+
+    const after = rear.map((u, i) => snapRow(u, idxs[i], i));
+
+    try {
+        if (typeof window !== 'undefined') {
+            window.__siRearPocketOrder = { before: before, after: after };
+        }
+        console.log('[SI-rear-pocket-order] before', before);
+        console.log('[SI-rear-pocket-order] after', after);
+    } catch (_) { /* */ }
+
+    return list;
+}
+
+/** Rear-pocket plate stack big enough to need virgin floor width. */
+const CSPACK_V2_CRITICAL_REAR_MIN_MM = 2200;
+
+function csPackV2IsCriticalRearUnit(unit) {
+    if (!csPackV2IsRearPocketUnit(unit)) return false;
+    const src = unit._srcPackUnit;
+    const h = unit.siHints || (src && src.siHints) || null;
+    if (String(h && h.bundleType) !== 'plate_stack') return false;
+    const f = csPackV2Foot(unit);
+    return f.pl >= CSPACK_V2_CRITICAL_REAR_MIN_MM
+        && f.pw >= CSPACK_V2_CRITICAL_REAR_MIN_MM;
+}
+
+/**
+ * Move critical rear-pocket plate stacks to the head of the pack order.
+ * Everything else keeps its relative order (stable partition), and zone
+ * preference is untouched — these units still seat as Z_REAR_POCKET.
+ * Ordering stage only: no geometry, collision or seat-search change.
+ */
+function csPackV2PromoteCriticalRearUnits(units) {
+    const list = Array.isArray(units) ? units : [];
+    const critical = [];
+    const rest = [];
+    const beforeIndex = [];
+    const promotedSeqs = [];
+
+    for (let i = 0; i < list.length; i++) {
+        const u = list[i];
+        if (u && csPackV2IsCriticalRearUnit(u)) {
+            critical.push(u);
+            beforeIndex.push(i);
+            promotedSeqs.push(csPackV2SiLoadSeq(u));
+        } else {
+            rest.push(u);
+        }
+    }
+
+    if (!critical.length) {
+        try {
+            if (typeof window !== 'undefined') {
+                window.__siCriticalRearPromotion = {
+                    beforeIndex: [],
+                    afterIndex: [],
+                    promotedSeqs: [],
+                };
+            }
+        } catch (_) { /* */ }
+        return list;
+    }
+
+    const out = critical.concat(rest);
+    for (let i = 0; i < out.length; i++) list[i] = out[i];
+
+    const afterIndex = critical.map((_, i) => i);
+
+    try {
+        if (typeof window !== 'undefined') {
+            window.__siCriticalRearPromotion = {
+                beforeIndex: beforeIndex,
+                afterIndex: afterIndex,
+                promotedSeqs: promotedSeqs,
+                detail: critical.map((u, i) => {
+                    const f = csPackV2Foot(u);
+                    return {
+                        loadSeq: promotedSeqs[i],
+                        mark: u && u.mark || null,
+                        beforeIndex: beforeIndex[i],
+                        afterIndex: afterIndex[i],
+                        packLengthMm: f.pl,
+                        packWidthMm: f.pw,
+                        weightKg: csPackV2UnitWeightKg(u),
+                    };
+                }),
+            };
+        }
+        console.log('[SI-critical-rear] promoted', {
+            count: critical.length,
+            promotedSeqs: promotedSeqs,
+            beforeIndex: beforeIndex,
+            afterIndex: afterIndex,
+        });
+    } catch (_) { /* */ }
+
+    return list;
+}
+
 /**
  * Pack like a human on the yard — LAYER BY LAYER in staging order:
  *  1. Take the next unit (1, then 2, then 3…).
@@ -9264,7 +9970,8 @@ function csPackV2SortHumanOrder(units) {
 function csPackV2PackHuman(units, opts) {
     const o = opts || {};
     const enableStacks = o.enableStacks !== false;
-    const ordered = csPackV2SortHumanOrder(units);
+    const ordered = csPackV2PromoteCriticalRearUnits(
+        csPackV2ReorderRearPocketOrder(csPackV2SortHumanOrder(units)));
     const init = csPackV2InitialFreeRects(o.containerSpec);
     const env = o.envelope || init.envelope;
     // Human loads: pieces nearly touch (5 mm). 20 mm left visible air gaps.
@@ -9288,9 +9995,33 @@ function csPackV2PackHuman(units, opts) {
     let feasiblePlaced = 0;
     let absurdFootprintCount = 0;
 
+    // TEMP SI debug 2b — immediately before PackHuman packing loop
+    // (after human sort + rearPocket area reorder — order the loop consumes)
+    if (typeof _siPackOrderReport === 'function' && typeof _siPackOrderSnap === 'function') {
+        _siPackOrderReport(
+            '[SI-pack-order] 2.beforePackHumanLoop',
+            _siPackOrderSnap(ordered)
+        );
+    }
+
     for (let i = 0; i < ordered.length; i++) {
         const unit = ordered[i];
         if (!unit) continue;
+
+        const srcPuLoop = unit._srcPackUnit;
+        const hintsLoop = unit.siHints
+            || (srcPuLoop && srcPuLoop.siHints) || null;
+        const loadSeqLoop = hintsLoop && hintsLoop.loadSeq != null
+            ? hintsLoop.loadSeq
+            : (unit._checkOrder != null ? unit._checkOrder : null);
+        const zoneLoop = hintsLoop ? hintsLoop.zonePref : null;
+        const watchLoop = (zoneLoop === 'Z_REAR_POCKET')
+            || (loadSeqLoop != null && +loadSeqLoop >= 71 && +loadSeqLoop <= 76);
+        const pushSkip = (row) => {
+            if (!watchLoop || typeof window === 'undefined') return;
+            if (!window.__siRearSkipTrace) window.__siRearSkipTrace = [];
+            window.__siRearSkipTrace.push(row);
+        };
 
         const foot = csPackV2Foot(unit);
         const absurd = (typeof cs8IsAbsurdAssemblyFootprint === 'function')
@@ -9304,11 +10035,42 @@ function csPackV2PackHuman(units, opts) {
             && !absurd;
         if (feasible) feasibleCount++;
 
+        pushSkip({
+            stage: 'PackHuman.enter',
+            loopIndex: i,
+            loadSeq: loadSeqLoop,
+            checkOrder: unit._checkOrder != null ? unit._checkOrder : null,
+            mark: unit.mark || null,
+            zonePref: zoneLoop,
+            bundleType: hintsLoop ? hintsLoop.bundleType : null,
+            groupKind: unit.groupKind || null,
+            foot: foot,
+            feasible: feasible,
+            absurd: !!absurd,
+            freeRectCount: freeRects.length,
+            placedCount: placed.length,
+            stackable: csPackV2IsStackableUnit(unit),
+        });
+
         // ── 1) Floor seat in current free rects ───────────────────────────
         const found = csPackV2FindFloorSeat(unit, freeRects, {
             envelope: env,
             placedBoxes,
             allowYaw: o.allowYaw !== false,
+        });
+        pushSkip({
+            stage: 'PackHuman.afterFindFloorSeat',
+            loopIndex: i,
+            loadSeq: loadSeqLoop,
+            mark: unit.mark || null,
+            zonePref: zoneLoop,
+            foundOk: !!found.ok,
+            foundReason: found.reason || null,
+            freeRectCount: freeRects.length,
+            maxFreeL: freeRects.reduce((m, r) =>
+                Math.max(m, r ? +r.length || 0 : 0), 0),
+            maxFreeW: freeRects.reduce((m, r) =>
+                Math.max(m, r ? +r.width || 0 : 0), 0),
         });
         if (found.ok) {
             const packUnit = found.viewUnit || unit;
@@ -9322,6 +10084,8 @@ function csPackV2PackHuman(units, opts) {
                     freeRects, found.rect, commit.placement, {
                         gapMm,
                         preferSideLane: true,
+                        // TEMP SI free-rect trace identity only (no seat change)
+                        unit: unit,
                     });
                 if (!applied.ok) {
                     freeRects = freeRects.filter(r => r !== found.rect
@@ -9339,15 +10103,44 @@ function csPackV2PackHuman(units, opts) {
                     corner: found.corner || null,
                     rectId: found.rect && found.rect.id,
                 });
+                pushSkip({
+                    stage: 'PackHuman.placedFloor',
+                    loopIndex: i,
+                    loadSeq: loadSeqLoop,
+                    mark: unit.mark || null,
+                    zonePref: zoneLoop,
+                    x: commit.placement.x,
+                    z: commit.placement.z,
+                    yawDeg: found.yawDeg || 0,
+                });
                 if (feasible) feasiblePlaced++;
                 continue;
             }
+            pushSkip({
+                stage: 'PackHuman.commitFloorFailed',
+                loopIndex: i,
+                loadSeq: loadSeqLoop,
+                mark: unit.mark || null,
+                zonePref: zoneLoop,
+                commitOk: !!(commit && commit.ok),
+                commitReason: commit && commit.reason || null,
+                foundReason: found.reason || null,
+            });
         }
 
         // ── 2) Floor full → climb onto a heavier/equal pad (next layer) ───
         if (enableStacks && placed.length
             && typeof csPackV2PlaceNestStacks === 'function'
             && csPackV2IsStackableUnit(unit)) {
+            pushSkip({
+                stage: 'PackHuman.tryStack',
+                loopIndex: i,
+                loadSeq: loadSeqLoop,
+                mark: unit.mark || null,
+                zonePref: zoneLoop,
+                floorFailReason: found ? found.reason : null,
+                placedCount: placed.length,
+            });
             const stackOne = csPackV2PlaceNestStacks([unit], placed, {
                 envelope: env,
                 containerSpec: o.containerSpec,
@@ -9366,6 +10159,14 @@ function csPackV2PackHuman(units, opts) {
                 stackedPlacements.push(...stackOne.stacked);
                 unit.fitReason = null;
                 unit.fitReasonMsg = null;
+                pushSkip({
+                    stage: 'PackHuman.placedStack',
+                    loopIndex: i,
+                    loadSeq: loadSeqLoop,
+                    mark: unit.mark || null,
+                    zonePref: zoneLoop,
+                    stackedCount: stackOne.stacked.length,
+                });
                 if (feasible) feasiblePlaced++;
                 continue;
             }
@@ -9380,6 +10181,16 @@ function csPackV2PackHuman(units, opts) {
                 mark: unit.mark || null,
                 fitReason: reason,
                 fitReasonMsg: unit.fitReasonMsg,
+            });
+            pushSkip({
+                stage: 'PackHuman.unplacedAfterStack',
+                loopIndex: i,
+                loadSeq: loadSeqLoop,
+                mark: unit.mark || null,
+                zonePref: zoneLoop,
+                floorFailReason: found ? found.reason : null,
+                stackFailReason: reason,
+                skipReason: 'FLOOR_FAIL_THEN_NO_STACK',
             });
             continue;
         }
@@ -9396,6 +10207,22 @@ function csPackV2PackHuman(units, opts) {
             mark: unit.mark || null,
             fitReason: cls.fitReason,
             fitReasonMsg: cls.fitReasonMsg,
+        });
+        pushSkip({
+            stage: 'PackHuman.unplacedNoStackPath',
+            loopIndex: i,
+            loadSeq: loadSeqLoop,
+            mark: unit.mark || null,
+            zonePref: zoneLoop,
+            floorFailReason: found ? found.reason : null,
+            fitReason: cls.fitReason,
+            stackable: csPackV2IsStackableUnit(unit),
+            enableStacks: enableStacks,
+            skipReason: !csPackV2IsStackableUnit(unit)
+                ? 'FLOOR_FAIL_NOT_STACKABLE'
+                : (!placed.length
+                    ? 'FLOOR_FAIL_NO_PAD_FOR_STACK'
+                    : 'FLOOR_FAIL_STACK_DISABLED_OR_MISSING'),
         });
     }
 
@@ -9497,12 +10324,427 @@ function csPackV2PackHuman(units, opts) {
     };
 }
 
+/** TEMP SI debug — order snapshot through RunOptimise → pack → placements. */
+function _siPackOrderSnap(list, opts) {
+    const o = opts || {};
+    const asPlacements = !!o.asPlacements;
+    const rows = [];
+    const arr = list || [];
+    for (let i = 0; i < arr.length; i++) {
+        const entry = arr[i];
+        const unit = asPlacements
+            ? (entry && (entry.unit || entry))
+            : entry;
+        if (!unit) continue;
+        const src = unit._srcPackUnit || null;
+        rows.push({
+            mark: unit.mark || (entry && entry.mark) || null,
+            stagingGroupId: unit.stagingGroupId
+                || (unit._srcGroup && unit._srcGroup.id)
+                || (src && src.stagingGroupId)
+                || null,
+            packUnitIndex: (unit.packUnitIndex != null)
+                ? unit.packUnitIndex
+                : (src && src.packUnitIndex),
+            checkOrder: unit._checkOrder != null ? unit._checkOrder : null,
+            loadSeq: (unit.siHints && unit.siHints.loadSeq != null)
+                ? unit.siHints.loadSeq
+                : (src && src.siHints && src.siHints.loadSeq != null
+                    ? src.siHints.loadSeq : null),
+            placementIndex: i,
+        });
+    }
+    return rows;
+}
+
+function _siPackOrderReport(tag, rows) {
+    try {
+        console.log(tag, rows);
+        if (typeof window !== 'undefined') {
+            if (!window.__siPackOrderTrace) window.__siPackOrderTrace = {};
+            window.__siPackOrderTrace[tag] = rows;
+        }
+    } catch (_) { /* */ }
+}
+
+/**
+ * TEMP SI diagnostic — trace the weight chain for a loadSeq range.
+ * Read-only: reports raw scene item kg → group kg → packUnit kg → packer kg,
+ * alongside the physical plate/section estimate. Changes nothing.
+ * Console: csPackV2DebugWeightTrace(71, 76)
+ *
+ * @param {number} [seqFrom=71]
+ * @param {number} [seqTo=76]
+ * @returns {object[]} rows (also printed and stored on window.__siWeightTrace)
+ */
+function csPackV2DebugWeightTrace(seqFrom, seqTo) {
+    const lo = seqFrom != null ? +seqFrom : 71;
+    const hi = seqTo != null ? +seqTo : 76;
+    const rows = [];
+    const groups = (typeof assemblyGroups !== 'undefined' && assemblyGroups)
+        ? assemblyGroups : [];
+    const rawItems = (typeof rawScene !== 'undefined' && rawScene && rawScene.items)
+        ? rawScene.items : [];
+
+    const num = (v) => (isFinite(+v) ? +v : 0);
+
+    (groups || []).forEach((g) => {
+        ((g && g.packUnits) || []).forEach((pu) => {
+            const h = pu && pu.siHints;
+            const seq = h && h.loadSeq != null
+                ? +h.loadSeq
+                : (pu && pu._checkOrder != null ? +pu._checkOrder : null);
+            if (seq == null || seq < lo || seq > hi) return;
+
+            const lengthMm = Math.max(num(pu.packLengthMm), num(pu.lengthMm));
+            const widthMm = Math.max(num(pu.packWidthMm), num(pu.widthMm));
+            const thickness = num(pu.sectT) || num(g.sectT)
+                || Math.min(num(pu.heightMm) || Infinity, num(pu.widthMm) || Infinity)
+                || 0;
+            const quantity = Math.max(
+                1,
+                num(pu.qty),
+                (pu.nestPieces && pu.nestPieces.length) || 0,
+                (pu.memberItems && pu.memberItems.length) || 0
+            );
+
+            // Physical single-plate steel weight from the stated geometry
+            const singleKg = (lengthMm / 1000) * (widthMm / 1000)
+                * (thickness / 1000) * 7850;
+            const computedWeight = singleKg * quantity;
+
+            // What the packer actually reads
+            const sourceWeight = (typeof csPackV2UnitWeightKg === 'function')
+                ? csPackV2UnitWeightKg(pu)
+                : Math.max(num(pu.weightKg), num(pu.total_weight));
+
+            // Raw scene items behind this mark
+            const marks = (pu.marks && pu.marks.length) ? pu.marks : [pu.mark];
+            const raws = rawItems.filter(it =>
+                it && marks.indexOf(it.mark) >= 0);
+            const rawUnitKg = raws.map(it => num(it.unitWeightKg));
+
+            const est = (typeof estimateBboxSteelKg === 'function')
+                ? estimateBboxSteelKg({
+                    lengthMm: lengthMm,
+                    widthMm: widthMm,
+                    heightMm: num(pu.heightMm) || thickness,
+                    sectT: num(pu.sectT) || num(g.sectT),
+                    sectW: num(pu.sectW) || num(g.sectW),
+                    sectH: num(pu.sectH) || num(g.sectH),
+                    shapeKey: pu.shapeKey || g.shapeKey,
+                    profileShape: pu.profileShape || g.profileShape,
+                    profileDesc: pu.profileDesc || g.profileDesc,
+                    mark: pu.mark || g.mark,
+                })
+                : 0;
+            const rawFirst = rawUnitKg.length ? rawUnitKg[0] : 0;
+            const normalized = (typeof normalizeMassToKg === 'function' && rawFirst > 0)
+                ? normalizeMassToKg(rawFirst, est)
+                : null;
+
+            rows.push({
+                loadSeq: seq,
+                mark: pu.mark || null,
+                thickness: thickness,
+                length: lengthMm,
+                width: widthMm,
+                quantity: quantity,
+                computedWeight: Math.round(computedWeight * 100) / 100,
+                sourceWeight: sourceWeight,
+                chain: {
+                    rawItemCount: raws.length,
+                    rawUnitWeightKg: rawUnitKg.slice(0, 6),
+                    // Raw item as loaded (its OWN dims — not the pack-unit dims)
+                    rawItem: raws[0] ? {
+                        mark: raws[0].mark,
+                        qty: num(raws[0].qty),
+                        lengthMm: num(raws[0].lengthMm),
+                        widthMm: num(raws[0].widthMm),
+                        heightMm: num(raws[0].heightMm),
+                        sectT: num(raws[0].sectT),
+                        sectH: num(raws[0].sectH),
+                        sectW: num(raws[0].sectW),
+                        shapeKey: raws[0].shapeKey || null,
+                        profileDesc: raws[0].profileDesc || null,
+                        weightEstimated: !!raws[0].weightEstimated,
+                        _weightWasScaled: !!raws[0]._weightWasScaled,
+                        ownEstimateKg: (typeof estimateBboxSteelKg === 'function')
+                            ? Math.round(estimateBboxSteelKg(raws[0]) * 100) / 100
+                            : null,
+                        // What the true 1.5 mm-style plate would weigh from sectT
+                        solidFromSectTKg: num(raws[0].sectT) > 0
+                            ? Math.round((num(raws[0].lengthMm) / 1000)
+                                * (num(raws[0].widthMm) / 1000)
+                                * (num(raws[0].sectT) / 1000) * 7850 * 100) / 100
+                            : null,
+                    } : null,
+                    bboxEstimateKg: Math.round(est * 100) / 100,
+                    normalizeMassToKg: normalized,
+                    group: {
+                        id: g.id || null,
+                        groupKind: g.groupKind || null,
+                        qty: num(g.qty),
+                        weightKg: num(g.weightKg),
+                        unitWeightKg: num(g.unitWeightKg),
+                        totalWeightKg: num(g.totalWeightKg),
+                        sortWeightKg: num(g.sortWeightKg),
+                        sectT: num(g.sectT),
+                    },
+                    packUnit: {
+                        packUnitIndex: pu.packUnitIndex,
+                        qty: num(pu.qty),
+                        nestPieces: (pu.nestPieces && pu.nestPieces.length) || 0,
+                        weightKg: num(pu.weightKg),
+                        total_weight: num(pu.total_weight),
+                        weight: num(pu.weight),
+                        unitWeightKg: num(pu.unitWeightKg),
+                        sectT: num(pu.sectT),
+                        packHeightMm: num(pu.packHeightMm),
+                    },
+                    inflationFactor: computedWeight > 0
+                        ? Math.round((sourceWeight / computedWeight) * 100) / 100
+                        : null,
+                },
+            });
+        });
+    });
+
+    rows.sort((a, b) => a.loadSeq - b.loadSeq);
+
+    try {
+        console.log('');
+        console.log('========== csPackV2DebugWeightTrace ' + lo + '–' + hi + ' ==========');
+        rows.forEach((r) => {
+            console.log({
+                loadSeq: r.loadSeq,
+                mark: r.mark,
+                thickness: r.thickness,
+                length: r.length,
+                width: r.width,
+                quantity: r.quantity,
+                computedWeight: r.computedWeight,
+                sourceWeight: r.sourceWeight,
+            });
+            console.log('   chain:', r.chain);
+        });
+        if (!rows.length) console.log('(no packUnits in that loadSeq range)');
+        console.log('========== end weight trace ==========');
+        console.log('');
+        if (typeof window !== 'undefined') window.__siWeightTrace = rows;
+    } catch (_) { /* */ }
+
+    return rows;
+}
+
+/**
+ * TEMP SI diagnostic — print a packing summary after Optimise.
+ * Read-only: reads the last (or supplied) Optimise result and reservations.
+ * Console: csPackV2DebugPackSummary()
+ *
+ * @param {object} [optimiseResult]  csPackV2RunOptimise return (default: last run)
+ * @returns {object} summary (also printed and stored on window.__siPackSummary)
+ */
+function csPackV2DebugPackSummary(optimiseResult) {
+    const opt = optimiseResult
+        || (typeof window !== 'undefined' ? window.__lastPackV2Optimise : null)
+        || null;
+    const pack = (opt && opt.pack) || null;
+    const placedList = (pack && pack.placed) || [];
+    const unplacedList = (pack && pack.unplaced) || [];
+    const units = (opt && opt.units) || [];
+
+    const unitOf = (entry) => (entry && (entry.unit || entry)) || null;
+    const seqOf = (entry) => csPackV2SiLoadSeq(unitOf(entry));
+    const isRear = (entry) => csPackV2IsRearPocketUnit(unitOf(entry));
+
+    const totalUnits = units.length || (placedList.length + unplacedList.length);
+    const placedCount = (pack && pack.placedCount != null)
+        ? pack.placedCount : placedList.length;
+    const unplacedCount = (pack && pack.unplacedCount != null)
+        ? pack.unplacedCount : unplacedList.length;
+    const stackedCount = (pack && pack.stackCount != null)
+        ? pack.stackCount
+        : placedList.filter(p =>
+            p && (p.role === 'nest_stack' || p.layer === 'stack')).length;
+
+    const resv = (typeof window !== 'undefined'
+        && window.__siReservations
+        && window.__siReservations.rearPocket)
+        ? window.__siReservations.rearPocket
+        : null;
+    const rearReservedCount = resv
+        ? (resv.unitCount != null ? resv.unitCount : (resv.units || []).length)
+        : units.filter(u => csPackV2IsRearPocketUnit(u)).length;
+    const rearPlacedCount = placedList.filter(isRear).length;
+
+    const placementPct = totalUnits > 0
+        ? Math.round((placedCount / totalUnits) * 1000) / 10
+        : 0;
+
+    const unplacedRows = unplacedList.map((e) => ({
+        loadSeq: seqOf(e),
+        mark: (e && e.mark) || (unitOf(e) && unitOf(e).mark) || null,
+        zonePref: (() => {
+            const u = unitOf(e);
+            const src = u && u._srcPackUnit;
+            const h = (u && u.siHints) || (src && src.siHints) || null;
+            return h ? h.zonePref : null;
+        })(),
+        fitReason: (e && e.fitReason) || null,
+    }));
+    unplacedRows.sort((a, b) =>
+        ((a.loadSeq != null ? a.loadSeq : 1e9)
+            - (b.loadSeq != null ? b.loadSeq : 1e9))
+        || String(a.mark || '').localeCompare(String(b.mark || '')));
+
+    const summary = {
+        totalUnits: totalUnits,
+        placedCount: placedCount,
+        unplacedCount: unplacedCount,
+        stackedCount: stackedCount,
+        rearPocketReservedCount: rearReservedCount,
+        rearPocketPlacedCount: rearPlacedCount,
+        placementPct: placementPct,
+        unplaced: unplacedRows,
+        strategy: (pack && pack.strategy) || null,
+    };
+
+    try {
+        console.log('');
+        console.log('========== csPackV2DebugPackSummary ==========');
+        if (!pack) {
+            console.log('(no pack result — run Optimise & Place first)');
+        }
+        console.log('total units          :', totalUnits);
+        console.log('placed               :', placedCount);
+        console.log('unplaced             :', unplacedCount);
+        console.log('stacked              :', stackedCount);
+        console.log('Z_REAR_POCKET resv   :', rearReservedCount);
+        console.log('Z_REAR_POCKET placed :', rearPlacedCount);
+        console.log('placement            :', placementPct + '%');
+        console.log('── unplaced (loadSeq | mark | zonePref | fitReason) ──');
+        if (!unplacedRows.length) {
+            console.log('(none)');
+        } else {
+            for (let i = 0; i < unplacedRows.length; i++) {
+                const r = unplacedRows[i];
+                console.log([r.loadSeq, r.mark, r.zonePref, r.fitReason].join(' | '));
+            }
+        }
+        console.log('========== end pack summary ==========');
+        console.log('');
+        if (typeof window !== 'undefined') window.__siPackSummary = summary;
+    } catch (_) { /* */ }
+
+    return summary;
+}
+
+/**
+ * TEMP SI reservation diagnostic — scan staging packUnits.siHints and
+ * estimate how much floor space each reserved zone wants protected.
+ * Does NOT filter seats or change packing.
+ *
+ * @param {object[]} groups  assemblyGroups (with packUnits + siHints)
+ * @returns {{
+ *   rearPocket: { required, units, estimatedArea, estimatedLength, estimatedWidth, marks },
+ *   doorClear:  { required, units, estimatedArea, estimatedLength, estimatedWidth, marks }
+ * }}
+ */
+function csPackV2BuildSIReservations(groups) {
+    const rear = [];
+    const door = [];
+
+    function footOf(pu) {
+        const pl = Math.max(
+            +pu.packLengthMm || 0, +pu.packFootprintL || 0,
+            +pu.lengthMm || 0, +(pu.stableBundleMm && pu.stableBundleMm.l) || 0, 0);
+        const pw = Math.max(
+            +pu.packWidthMm || 0, +pu.packFootprintW || 0,
+            +pu.widthMm || 0, +(pu.stableBundleMm && pu.stableBundleMm.w) || 0, 0);
+        return { pl: pl || 0, pw: pw || 0 };
+    }
+
+    function collect(zonePref, into) {
+        (groups || []).forEach((g) => {
+            if (!g) return;
+            (g.packUnits || []).forEach((pu) => {
+                if (!pu || !pu.siHints) return;
+                if (String(pu.siHints.zonePref || '') !== zonePref) return;
+                const f = footOf(pu);
+                into.push({
+                    stagingGroupId: g.id || pu.stagingGroupId || null,
+                    packUnitIndex: pu.packUnitIndex,
+                    mark: pu.mark || null,
+                    loadSeq: pu.siHints.loadSeq != null
+                        ? pu.siHints.loadSeq
+                        : (pu._checkOrder != null ? pu._checkOrder : null),
+                    bundleType: pu.siHints.bundleType || null,
+                    zonePref: zonePref,
+                    packLengthMm: f.pl,
+                    packWidthMm: f.pw,
+                    areaMm2: f.pl * f.pw,
+                });
+            });
+        });
+    }
+
+    collect('Z_REAR_POCKET', rear);
+    collect('Z_DOOR_CLEAR', door);
+
+    function summarize(zone, units) {
+        let estimatedArea = 0;
+        let estimatedLength = 0; // max X footprint (individual)
+        let estimatedWidth = 0;  // sum Z footprints (side-by-side pack estimate)
+        const marks = [];
+        for (let i = 0; i < units.length; i++) {
+            const u = units[i];
+            estimatedArea += +u.areaMm2 || 0;
+            estimatedLength = Math.max(estimatedLength, +u.packLengthMm || 0);
+            estimatedWidth += +u.packWidthMm || 0;
+            if (u.mark) marks.push(u.mark);
+        }
+        // TEMP diagnostic log — no placement effect
+        try {
+            console.log('[SI-reservation]', {
+                zone: zone,
+                unitCount: units.length,
+                marks: marks.slice(0, 40),
+                estimatedLength: estimatedLength,
+                estimatedWidth: estimatedWidth,
+                estimatedArea: estimatedArea,
+            });
+        } catch (_) { /* */ }
+        return {
+            required: units.length > 0,
+            units: units,
+            marks: marks,
+            unitCount: units.length,
+            estimatedArea: estimatedArea,
+            estimatedLength: estimatedLength,
+            estimatedWidth: estimatedWidth,
+        };
+    }
+
+    const out = {
+        rearPocket: summarize('Z_REAR_POCKET', rear),
+        doorClear: summarize('Z_DOOR_CLEAR', door),
+    };
+    try {
+        if (typeof window !== 'undefined') {
+            window.__siReservations = out;
+        }
+    } catch (_) { /* */ }
+    return out;
+}
+
 function csPackV2RunOptimise(opts) {
     const o = opts || {};
     const enableStacks = o.enableStacks !== false;
     const spec = csPackV2ContainerSpec(o.containerSpec);
 
     let units = o.units ? o.units.slice() : null;
+    let groupsForSi = o.groups || null;
     if (!units) {
         const groups = o.groups || [];
         if (!groups.length)
@@ -9511,6 +10753,7 @@ function csPackV2RunOptimise(opts) {
                 placedItems: [], leftoverItems: [], layout: null, toast: 'No staging groups',
             };
         csPackV2EnsureGroupPackUnits(groups);
+        groupsForSi = groups;
         units = csPackV2BuildUnits(groups, {
             containerSpec: spec,
             checkedOnly: o.checkedOnly !== false,
@@ -9525,10 +10768,81 @@ function csPackV2RunOptimise(opts) {
         };
     }
 
+    // TEMP SI reservation diagnostic — before PackHuman (no filtering yet)
+    try {
+        let gScan = groupsForSi;
+        if (!gScan || !gScan.length) {
+            // Fallback: unique _srcGroup refs from built units
+            const seen = [];
+            const map = {};
+            (units || []).forEach((u) => {
+                const g = u && u._srcGroup;
+                if (!g || !g.id || map[g.id]) return;
+                map[g.id] = true;
+                seen.push(g);
+            });
+            gScan = seen;
+        }
+        csPackV2BuildSIReservations(gScan);
+    } catch (_) { /* */ }
+
+    // TEMP SI — confirm reservation loadSeqs still present in BuildUnits list
+    try {
+        if (typeof window !== 'undefined') {
+            window.__siRearSkipTrace = [];
+            const resvUnits = (window.__siReservations
+                && window.__siReservations.rearPocket
+                && window.__siReservations.rearPocket.units) || [];
+            const watched = resvUnits.filter((u) =>
+                u && u.loadSeq != null && +u.loadSeq >= 71 && +u.loadSeq <= 76);
+            const unitSnap = (units || []).map((u, idx) => {
+                const src = u && u._srcPackUnit;
+                const h = (u && u.siHints) || (src && src.siHints) || null;
+                const ls = h && h.loadSeq != null
+                    ? h.loadSeq
+                    : (u && u._checkOrder != null ? u._checkOrder : null);
+                return {
+                    idx: idx,
+                    loadSeq: ls,
+                    checkOrder: u && u._checkOrder != null ? u._checkOrder : null,
+                    mark: u && u.mark,
+                    zonePref: h ? h.zonePref : null,
+                    pl: u ? +u.packLengthMm : null,
+                    pw: u ? +u.packWidthMm : null,
+                    ph: u ? +u.packHeightMm : null,
+                };
+            });
+            const inBuild = unitSnap.filter((u) =>
+                u.loadSeq != null && +u.loadSeq >= 71 && +u.loadSeq <= 76);
+            const missing = watched.filter((w) =>
+                !inBuild.some((b) => +b.loadSeq === +w.loadSeq));
+            window.__siRearPrePackPresence = {
+                reservationWatched: watched,
+                inBuildUnits: inBuild,
+                missingFromBuildUnits: missing,
+                totalBuildUnits: unitSnap.length,
+            };
+            console.log('[SI-rear-skip] prePackPresence', window.__siRearPrePackPresence);
+        }
+    } catch (_) { /* */ }
+
+    // TEMP SI debug 1 — immediately after BuildUnits (sorted by _checkOrder)
+    _siPackOrderReport(
+        '[SI-pack-order] 1.afterBuildUnits',
+        _siPackOrderSnap(units)
+    );
+
     // Default = deterministic 2.5D (twin floor spine → nests/plates, zero float).
     // Fallbacks: binpack | human | twins via packStrategy.
     let pack;
     const strat = String(o.packStrategy || 'deterministic_25d');
+
+    // TEMP SI debug 2a — immediately before packing dispatch
+    _siPackOrderReport(
+        '[SI-pack-order] 2.beforePackDispatch',
+        _siPackOrderSnap(units)
+    );
+
     if (strat === 'twins') {
         pack = csPackV2PackWithTwins(units, {
             containerSpec: spec,
@@ -9544,6 +10858,7 @@ function csPackV2RunOptimise(opts) {
             enableStacks,
             bearingMin: o.bearingMin,
             allowYaw: o.allowYaw,
+            gapMm: o.gapMm,
         });
     } else if (strat === 'binpack'
         && typeof csBinPackPackHuman === 'function'
@@ -9580,6 +10895,91 @@ function csPackV2RunOptimise(opts) {
             allowYaw: o.allowYaw,
         });
     }
+
+    // TEMP SI debug 3 — immediately after placements generated
+    _siPackOrderReport(
+        '[SI-pack-order] 3.afterPlacements',
+        _siPackOrderSnap((pack && pack.placed) || [], { asPlacements: true })
+    );
+
+    // TEMP SI debug 4 — placed coords sorted by loadSeq (first 30)
+    try {
+        const env = (pack && pack.envelope)
+            || csPackV2FloorEnvelope(spec);
+        const halfW = Math.max(+env.widthMm || 0, 1) * 0.5;
+        const lenMm = Math.max(+env.lengthMm || 0, 1);
+        const placedRows = ((pack && pack.placed) || []).map((p, i) => {
+            const unit = p && (p.unit || p);
+            const src = unit && unit._srcPackUnit;
+            const h = (unit && unit.siHints)
+                || (src && src.siHints)
+                || null;
+            const x = p && p.x != null ? +p.x
+                : (p && p.box ? +p.box.minX : null);
+            const y = p && p.y != null ? +p.y
+                : (p && p.box ? +p.box.minY : null);
+            const z = p && p.z != null ? +p.z
+                : (p && p.box ? +p.box.minZ : null);
+            const loadSeq = h && h.loadSeq != null
+                ? +h.loadSeq
+                : (unit && unit._checkOrder != null ? +unit._checkOrder : null);
+            // Rough physical lane vs SI zone (diagnostic only)
+            let zLane = null;
+            if (z != null && isFinite(z)) {
+                if (z < -halfW * 0.25) zLane = 'far_side';
+                else if (z > halfW * 0.25) zLane = 'home_side';
+                else zLane = 'centre';
+            }
+            let xBand = null;
+            if (x != null && isFinite(x) && lenMm > 0) {
+                const t = x / lenMm;
+                if (t < 0.33) xBand = 'door_third';
+                else if (t < 0.66) xBand = 'mid_third';
+                else xBand = 'rear_third';
+            }
+            return {
+                loadSeq: loadSeq,
+                mark: (unit && unit.mark) || (p && p.mark) || null,
+                stagingGroupId: (unit && unit.stagingGroupId)
+                    || (unit && unit._srcGroup && unit._srcGroup.id)
+                    || null,
+                x: x,
+                y: y,
+                z: z,
+                zonePref: h ? h.zonePref : null,
+                layerIntent: h ? h.layerIntent : null,
+                pairSide: h ? h.pairSide : null,
+                role: (p && p.role) || null,
+                layer: (p && p.layer) || null,
+                zLane: zLane,
+                xBand: xBand,
+                placementIndex: i,
+            };
+        });
+        placedRows.sort((a, b) =>
+            ((a.loadSeq != null ? a.loadSeq : 1e9)
+                - (b.loadSeq != null ? b.loadSeq : 1e9))
+            || String(a.mark || '').localeCompare(String(b.mark || '')));
+        const first30 = placedRows.slice(0, 30);
+        console.log('[SI-placed-xyz] first30 by loadSeq', first30);
+        console.log('[SI-placed-xyz] envelope', {
+            lengthMm: env.lengthMm,
+            widthMm: env.widthMm,
+            heightMm: env.heightMm,
+            halfW: halfW,
+        });
+        if (typeof window !== 'undefined') {
+            window.__siPlacedXyz = first30;
+            window.__siPlacedXyzAll = placedRows;
+            if (!window.__siPackOrderTrace) window.__siPackOrderTrace = {};
+            window.__siPackOrderTrace.strategy = (pack && pack.strategy) || strat;
+            window.__siPackOrderTrace.placedCount =
+                (pack && pack.placed && pack.placed.length) || 0;
+            window.__siPackOrderTrace.unplacedCount =
+                (pack && pack.unplaced && pack.unplaced.length) || 0;
+            window.__siPackOrderTrace.placedXyzFirst30 = first30;
+        }
+    } catch (_) { /* */ }
 
     const targets = units.map(u => ({ item: csPackV2MakeRenderItemFromUnit(u) }));
     const apply = csPackV2ApplyPlacementsToTargets(pack, targets, {
@@ -9689,6 +11089,10 @@ function csPackV2RunOptimise(opts) {
             window.__lastPackV2Report = report;
         }
     } catch (_) { /* */ }
+
+    // TEMP SI diagnostic — packing summary print (reporting only)
+    try { csPackV2DebugPackSummary(out); } catch (_) { /* */ }
+
     return out;
 }
 

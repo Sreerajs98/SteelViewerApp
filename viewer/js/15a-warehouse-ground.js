@@ -264,7 +264,13 @@ function orientObjectToWarehouseGround(obj, it) {
  */
 function groundOrientItem(it, threeObject) {
   if (!threeObject || typeof THREE === 'undefined') {
-    return { ok: false, reason: 'no_object', stages: [] };
+    const _fail = { ok: false, reason: 'no_object', stages: [] };
+    try {
+      console.warn('[groundOrientItem] ok=false', {
+        mark: it && it.mark, reason: _fail.reason, groupKind: it && it.groupKind,
+      });
+    } catch (_) { /* */ }
+    return _fail;
   }
   const stages = [];
   const keepX = threeObject.position.x;
@@ -310,6 +316,9 @@ function groundOrientItem(it, threeObject) {
       if (threeObject.userData) threeObject.userData.rule1Ground = info;
       if (it) it._rule1GroundResult = info;
     } catch (_) { /* */ }
+    // Rafter plan yaw only (no-op for non-rafters)
+    if (typeof cstabKillRafterChariv === 'function')
+      cstabKillRafterChariv(threeObject, it);
     return info;
   }
 
@@ -336,6 +345,8 @@ function groundOrientItem(it, threeObject) {
       if (threeObject.userData) threeObject.userData.rule1Ground = info;
       if (it) it._rule1GroundResult = info;
     } catch (_) { /* */ }
+    if (typeof cstabKillRafterChariv === 'function')
+      cstabKillRafterChariv(threeObject, it);
     return info;
   }
 
@@ -383,6 +394,18 @@ function groundOrientItem(it, threeObject) {
       it._warehouseGroundPreferred = true;
     }
   } catch (_) { /* */ }
+  if (!info.ok) {
+    try {
+      console.warn('[groundOrientItem] ok=false', {
+        mark: it && it.mark,
+        groupKind: it && it.groupKind,
+        isAssembly: !!(it && it.isAssembly),
+        method: info.method,
+        floor_y: info.floor_y,
+        stages: info.stages,
+      });
+    } catch (_) { /* */ }
+  }
   return info;
 }
 

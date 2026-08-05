@@ -326,9 +326,36 @@ function cspuBundleBBox(pieces, nestInfo, method, stageGroup) {
   const n = pieces.length;
   const L = Math.max(...pieces.map(p => p.lengthMm || 0), stageGroup.lengthMm || 0, 1);
   const H = Number(stageGroup.sectH) || Number(pieces[0]?.sectH) || Number(stageGroup.virtualHmm) || 1;
-  const W = Number(stageGroup.sectW) || Number(pieces[0]?.sectW) || Number(stageGroup.virtualWmm) || 1;
+  let W = Number(stageGroup.sectW) || Number(pieces[0]?.sectW) || Number(stageGroup.virtualWmm) || 1;
   const T = Number(stageGroup.sectT) || Number(pieces[0]?.sectT) || 1;
   const off = Number(nestInfo?.nesting_offset) || 0;
+
+  // Plates: sectW is the stock width the part was cut from, so it can only be
+  // the bundle width when the piece actually measures that wide.
+  const isPlateFam = stageGroup.groupKind === 'stack_plate'
+    || stageGroup.shapeKey === 'plate'
+    || stageGroup.category === 'plate';
+  if (isPlateFam && typeof resolvePlatePlanWidthMm === 'function') {
+    const src = pieces[0] || stageGroup;
+    const planW = resolvePlatePlanWidthMm(src, Number(stageGroup.virtualWmm) || 0);
+    if (planW > 0 && planW < W) {
+      if (typeof _siPlateSectionDebug === 'function') {
+        _siPlateSectionDebug('bundleWidth', {
+          mark: stageGroup.mark || (pieces[0] && pieces[0].mark) || null,
+          sectT: Number(stageGroup.sectT) || 0,
+          sectH: Number(stageGroup.sectH) || 0,
+          sectW: Number(stageGroup.sectW) || 0,
+          oldThickness: T,
+          newThickness: T,
+          oldPlanWidth: W,
+          newPlanWidth: planW,
+          method: method || null,
+          pieces: n,
+        });
+      }
+      W = planW;
+    }
+  }
 
   if (method === 'INTERLOCK_NEST' && typeof computeInterlockWorldYPlacements === 'function') {
     try {

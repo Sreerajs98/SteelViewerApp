@@ -92,6 +92,23 @@ function csShipPrepNailGround(mesh) {
  */
 function csShipPrepTipLevel(mesh, keepX, keepZ) {
   if (!mesh || typeof THREE === 'undefined') return { tipGapMm: 1e9 };
+  // Skip expensive tip-level search for large assemblies — they are
+  // already flattened by groundOrientItem. tip > 200mm means a big
+  // welded assembly (rafter/column) — just snap to ground and return.
+  {
+    mesh.updateMatrixWorld(true);
+    const bb = new THREE.Box3().setFromObject(mesh);
+    const height = bb.max.y - bb.min.y;
+    const length = Math.max(bb.max.x - bb.min.x, bb.max.z - bb.min.z);
+    if (length > height * 5) {
+      // Already flat (length >> height) — just nail to ground
+      if (typeof csNzSnapObjectToGround === 'function') {
+        csNzSnapObjectToGround(mesh);
+      }
+      return { tipGapMm: (typeof csShipPrepTipGapMm === 'function')
+        ? csShipPrepTipGapMm(mesh) : 0 };
+    }
+  }
   const kx = keepX != null ? keepX : mesh.position.x;
   const kz = keepZ != null ? keepZ : mesh.position.z;
   // Shipping needs full flatten. A 35° cap left pitched rafters leaning in the
@@ -886,6 +903,14 @@ function csShipPrepMesh(mesh, it) {
       csShipPrepNailGround(mesh);
       tipGapMm = csShipPrepTipGapMm(mesh);
       method = 'assembly_ship_prep_on_edge';
+    }
+    // Re-apply rafter plan yaw after tip/flat/solid (those can reintroduce chariv)
+    if (typeof cstabKillRafterChariv === 'function') {
+      cstabKillRafterChariv(mesh, it);
+      mesh.position.x = keepX;
+      mesh.position.z = keepZ;
+      csShipPrepNailGround(mesh);
+      tipGapMm = csShipPrepTipGapMm(mesh);
     }
     csShipPrepStamp(it, mesh, cls, tipGapMm);
     return { ok: true, class: cls, tipGapMm, method };

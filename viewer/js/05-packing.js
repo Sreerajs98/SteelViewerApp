@@ -40,6 +40,93 @@ const FILL_FACTORS = {
 /** Max plausible single cargo unit (kg) — above this cannot be real kg for one placeable unit. */
 const WEIGHT_MAX_UNIT_KG = 26000;
 
+/** Above this a parsed section field is a plan dimension, not a plate thickness (mm). */
+const PLATE_SECTION_MAX_THICKNESS_MM = 80;
+
+/**
+ * Resolve plate / flat section dims from a raw item or pack unit.
+ *
+ * Tekla "PL1.5*2270" parses to H = thickness and W = width, leaving T at 0, so
+ * thickness must read sectH before sectT. sectW is the stock width the part was
+ * cut from — never the thickness, and never a measured plan dimension on its
+ * own (a 71 mm strip cut from 2270 stock still carries sectW = 2270).
+ *
+ * @param {object} it  item / unit with sect* and bbox dims
+ * @returns {{ thicknessMm: number, profileWidthMm: number,
+ *   bboxThicknessMm: number, planWidthMm: number, source: string|null }}
+ */
+function resolvePlateSectionDims(it) {
+  const pos = (v) => (Number(v) > 0 ? Number(v) : 0);
+  const sectH = pos(it && it.sectH);
+  const sectT = pos(it && it.sectT);
+  const sectW = pos(it && it.sectW);
+  const L = pos(it && (it.lengthMm != null ? it.lengthMm : it.l));
+  const W = pos(it && (it.widthMm != null ? it.widthMm : it.w));
+  const H = pos(it && (it.heightMm != null ? it.heightMm : it.h));
+
+  const dims = [L, W, H].filter(v => v > 0).sort((a, b) => a - b);
+  const bboxThicknessMm = dims.length ? dims[0] : 0;
+  // Thin axis is thickness and the long axis is length, so the plan width the
+  // part actually measures is the middle axis.
+  const planWidthMm = dims.length >= 2 ? dims[dims.length - 2] : 0;
+
+  const isThickness = (t) => t > 0 && t <= PLATE_SECTION_MAX_THICKNESS_MM
+    && (sectW <= 0 || t < sectW);
+
+  let thicknessMm = 0;
+  let source = null;
+  if (isThickness(sectH)) {
+    thicknessMm = sectH;
+    source = 'sectH';
+  } else if (isThickness(sectT)) {
+    thicknessMm = sectT;
+    source = 'sectT';
+  } else if (bboxThicknessMm > 0) {
+    thicknessMm = bboxThicknessMm;
+    source = 'bbox';
+  }
+
+  return {
+    thicknessMm: thicknessMm,
+    profileWidthMm: sectW,
+    bboxThicknessMm: bboxThicknessMm,
+    planWidthMm: planWidthMm,
+    source: source,
+  };
+}
+
+/**
+ * Plan width for a plate seat: stock width, but never wider than the piece
+ * actually measures.
+ *
+ * @param {object} it
+ * @param {number} [fallbackWidthMm]
+ * @returns {number}
+ */
+function resolvePlatePlanWidthMm(it, fallbackWidthMm) {
+  const pd = resolvePlateSectionDims(it);
+  const stock = pd.profileWidthMm;
+  const measured = pd.planWidthMm;
+  if (stock > 0 && (!(measured > 0) || stock <= measured + 0.5)) return stock;
+  if (measured > 0) return measured;
+  return Math.max(0, Number(fallbackWidthMm) || 0) || stock;
+}
+
+/** TEMP SI debug — record plate section before/after per mark (no logic effect). */
+function _siPlateSectionDebug(tag, row) {
+  try {
+    if (typeof window === 'undefined' || !row) return;
+    if (!window.__siPlateSectionFix) window.__siPlateSectionFix = {};
+    const store = window.__siPlateSectionFix;
+    if (!store[tag]) store[tag] = [];
+    const key = String(row.mark || '') + '|' + tag;
+    if (!store._seen) store._seen = {};
+    if (store._seen[key]) return;
+    store._seen[key] = true;
+    store[tag].push(row);
+  } catch (_) { /* */ }
+}
+
 /**
  * Prefer section formula over fat assembly AABB (AABB×0.08 often looks like tonnes
  * and blocks grams→kg for rods/plates).
@@ -63,12 +150,27 @@ function estimateBboxSteelKg(it) {
     if (L > 0 && d > 0)
       return Math.PI * Math.pow(d / 2000, 2) * (L / 1000) * dens;
   }
-  // Plate / flat
+  // Plate / flat — thickness from the section stamp, width kept separate
   if (sk === 'plate' || /\bPL(ATE)?\b|\bFLAT\b|PANEL/.test(blob)) {
-    const th = Math.max(Number(it.sectT) || 0, Math.min(Number(it.heightMm) || 0, Number(it.widthMm) || 0) || 0, 6);
-    const W = Math.max(Number(it.sectW) || 0, Number(it.widthMm) || 0, Number(it.heightMm) || 0, 1);
-    if (L > 0 && W > 0 && th > 0)
-      return (L / 1000) * (W / 1000) * (th / 1000) * dens;
+    const pd = resolvePlateSectionDims(it);
+    const th = pd.thicknessMm;
+    const W = Math.max(pd.profileWidthMm, Number(it.widthMm) || 0,
+      Number(it.heightMm) || 0, 1);
+    if (L > 0 && W > 0 && th > 0) {
+      const kg = (L / 1000) * (W / 1000) * (th / 1000) * dens;
+      _siPlateSectionDebug('weightEstimate', {
+        mark: it.mark || null,
+        sectT: Number(it.sectT) || 0,
+        sectH: Number(it.sectH) || 0,
+        sectW: Number(it.sectW) || 0,
+        oldThickness: Math.max(Number(it.sectT) || 0,
+          Math.min(Number(it.heightMm) || 0, Number(it.widthMm) || 0) || 0, 6),
+        newThickness: th,
+        thicknessSource: pd.source,
+        estimatedKg: Math.round(kg * 100) / 100,
+      });
+      return kg;
+    }
   }
 
   const W = Math.max(0, Number(it.widthMm) || Number(it.sectW) || 0);
@@ -466,20 +568,50 @@ function expandUnits(items, spec) {
                  unitWidth:sW, unitHeight:sH, channelLength:g.l,
                  cLaidFlat: true };
       }
-      const thickness = (p === 'plate' || g.category === 'plate')
-        ? (g.sectH > 0 ? g.sectH : Math.min(g.h, g.w))
+      const isPlate = (p === 'plate' || g.category === 'plate');
+      const pd1 = isPlate ? resolvePlateSectionDims(g) : null;
+      const thickness = isPlate
+        ? (pd1.thicknessMm || Math.min(g.h, g.w))
         : sH;
-      const plateW = (p === 'plate' || g.category === 'plate')
-        ? (g.sectW > 0 ? g.sectW : Math.max(g.h, g.w))
+      const plateW = isPlate
+        ? (resolvePlatePlanWidthMm(g, Math.max(g.h, g.w)) || Math.max(g.h, g.w))
         : sW;
+      if (isPlate) {
+        _siPlateSectionDebug('planWidth', {
+          mark: g.mark || null,
+          sectT: Number(g.sectT) || 0,
+          sectH: Number(g.sectH) || 0,
+          sectW: Number(g.sectW) || 0,
+          oldThickness: g.sectH > 0 ? g.sectH : Math.min(g.h, g.w),
+          newThickness: thickness,
+          oldPlanWidth: g.sectW > 0 ? g.sectW : Math.max(g.h, g.w),
+          newPlanWidth: plateW,
+          measuredPlanWidth: pd1.planWidthMm,
+          qty: 1,
+        });
+      }
       return { ...base, l:g.l, w:plateW, h:thickness, weight, qty:1, stacked:false,
                unitWidth:plateW, unitHeight:thickness };
     }
 
     // PLATES / sheets — sets of 5–6 stacked in one place (user grouping rule)
     if (p === 'plate' || (!p && g.category === 'plate')) {
-      const thickness = g.sectH > 0 ? g.sectH : Math.min(g.h, g.w);
-      const plateW    = g.sectW > 0 ? g.sectW : Math.max(g.h, g.w);
+      const pdN = resolvePlateSectionDims(g);
+      const thickness = pdN.thicknessMm || Math.min(g.h, g.w);
+      const plateW = resolvePlatePlanWidthMm(g, Math.max(g.h, g.w))
+        || Math.max(g.h, g.w);
+      _siPlateSectionDebug('planWidth', {
+        mark: g.mark || null,
+        sectT: Number(g.sectT) || 0,
+        sectH: Number(g.sectH) || 0,
+        sectW: Number(g.sectW) || 0,
+        oldThickness: g.sectH > 0 ? g.sectH : Math.min(g.h, g.w),
+        newThickness: thickness,
+        oldPlanWidth: g.sectW > 0 ? g.sectW : Math.max(g.h, g.w),
+        newPlanWidth: plateW,
+        measuredPlanWidth: pdN.planWidthMm,
+        qty: qty,
+      });
       const SHEET_SET = 6;
       const nStack = Math.min(qty, SHEET_SET);
       const nCols = Math.ceil(qty / nStack);
