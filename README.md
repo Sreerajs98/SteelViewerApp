@@ -1,4 +1,4 @@
-# Steel Container 3D Viewer - WinForms desktop app
+# Steel Container 3D Viewer 
 
 A native Windows desktop app (WinForms, like AJM) with two buttons and an
 embedded 3D view:
